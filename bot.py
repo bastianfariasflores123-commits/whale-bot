@@ -579,19 +579,115 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "hoy":
-        await cmd_hoy(update, ctx)
+        stats = db.obtener_estadisticas_periodo(1)
+        if stats["total_trades"] == 0:
+            await query.message.reply_text("📅 *Hoy*\n\nAún no hay trades cerrados hoy.", parse_mode="Markdown")
+        else:
+            pnl   = stats["pnl_total"]
+            emoji = "📈" if pnl >= 0 else "📉"
+            signo = "+" if pnl >= 0 else ""
+            wr    = int(stats["win_rate"] / 10)
+            barra = "█" * wr + "░" * (10 - wr)
+            texto = (
+                f"📅 *Resumen de hoy*\n\n"
+                f"{emoji} *Ganancia del día: `{signo}${pnl}`*\n\n"
+                f"🔢 Trades: `{stats['total_trades']}`\n"
+                f"✅ Ganados: `{stats['ganados']}`\n"
+                f"❌ Perdidos: `{stats['perdidos']}`\n"
+                f"🏆 Win rate: `{stats['win_rate']}%`\n"
+                f"`{barra}`\n\n"
+                f"💰 Mejor trade: `+${stats['mejor_trade']}`\n"
+                f"💸 Peor trade: `${stats['peor_trade']}`"
+            )
+            await query.message.reply_text(texto, parse_mode="Markdown")
 
     elif data == "semana":
-        await cmd_semana(update, ctx)
+        stats = db.obtener_resumen_semanal()
+        if stats["total_trades"] == 0:
+            await query.message.reply_text("📆 *Esta semana*\n\nAún no hay trades esta semana.", parse_mode="Markdown")
+        else:
+            pnl      = stats["pnl_total"]
+            variacion = stats["variacion_pct"]
+            emoji    = "📈" if pnl >= 0 else "📉"
+            signo    = "+" if pnl >= 0 else ""
+            flecha   = f"⬆️ +{variacion}%" if variacion > 0 else f"⬇️ {variacion}%"
+            wr       = int(stats["win_rate"] / 10)
+            barra    = "█" * wr + "░" * (10 - wr)
+            grafico  = _grafico_dias(stats["ganancias_por_dia"])
+            texto = (
+                f"📆 *Resumen semanal*\n\n"
+                f"{emoji} *Ganancia semana: `{signo}${pnl}`*\n"
+                f"{flecha} vs semana anterior\n\n"
+                f"🔢 Trades: `{stats['total_trades']}`\n"
+                f"✅ Ganados: `{stats['ganados']}`\n"
+                f"❌ Perdidos: `{stats['perdidos']}`\n"
+                f"🏆 Win rate: `{stats['win_rate']}%`\n"
+                f"`{barra}`\n\n"
+                f"📅 *Por día:*\n{grafico}\n\n"
+                f"📈 Promedio diario: `{'+' if stats['promedio_diario'] >= 0 else ''}${stats['promedio_diario']}`"
+            )
+            await query.message.reply_text(texto, parse_mode="Markdown")
 
     elif data == "mes":
-        await cmd_mes(update, ctx)
+        stats = db.obtener_resumen_mensual()
+        if stats["total_trades"] == 0:
+            await query.message.reply_text("🗓️ *Este mes*\n\nAún no hay trades este mes.", parse_mode="Markdown")
+        else:
+            pnl        = stats["pnl_total"]
+            proyeccion = stats["proyeccion_mes"]
+            emoji      = "📈" if pnl >= 0 else "📉"
+            signo      = "+" if pnl >= 0 else ""
+            meta       = 100.0
+            progreso   = min((pnl / meta) * 100, 100) if meta > 0 else 0
+            llenas     = int(progreso / 10)
+            barra_meta = "█" * llenas + "░" * (10 - llenas)
+            dias_txt   = f"⏳ Días para $100: `{stats['dias_para_meta']} días`" if pnl < meta else "🎯 ¡Meta de $100 alcanzada!"
+            wr         = int(stats["win_rate"] / 10)
+            barra_wr   = "█" * wr + "░" * (10 - wr)
+            texto = (
+                f"🗓️ *Resumen mensual*\n"
+                f"_{stats['dias_activo']} días activo_\n\n"
+                f"{emoji} *Ganancia del mes: `{signo}${pnl}`*\n\n"
+                f"🎯 *Progreso hacia $100:*\n"
+                f"`{barra_meta}` {progreso:.0f}%\n"
+                f"{dias_txt}\n\n"
+                f"🔢 Trades: `{stats['total_trades']}`\n"
+                f"🏆 Win rate: `{stats['win_rate']}%` `{barra_wr}`\n\n"
+                f"📈 Promedio diario: `{'+' if stats['promedio_diario'] >= 0 else ''}${stats['promedio_diario']}`\n"
+                f"🔮 Proyección al mes: `+${proyeccion}`"
+            )
+            await query.message.reply_text(texto, parse_mode="Markdown")
 
     elif data == "estadisticas":
-        await cmd_stats(update, ctx)  # reutiliza el comando
+        stats = db.obtener_estadisticas()
+        emoji_pnl = "📈" if stats["pnl_total"] >= 0 else "📉"
+        texto = (
+            f"📊 *Estadísticas totales:*\n\n"
+            f"🔢 Trades totales: `{stats['total_trades']}`\n"
+            f"✅ Ganados: `{stats['ganados']}`\n"
+            f"❌ Perdidos: `{stats['perdidos']}`\n"
+            f"🏆 Win rate: `{stats['win_rate']:.1f}%`\n"
+            f"{emoji_pnl} P&L total: `${stats['pnl_total']:.2f}`\n"
+            f"💵 Mejor trade: `+${stats['mejor_trade']:.2f}`\n"
+            f"💸 Peor trade: `${stats['peor_trade']:.2f}`"
+        )
+        await query.message.reply_text(texto, parse_mode="Markdown")
 
     elif data == "config":
-        await cmd_config(update, ctx)
+        cfg = db.obtener_config()
+        texto = (
+            f"⚙️ *Configuración actual:*\n\n"
+            f"💰 Cantidad por trade: `${cfg['monto_usd']} USD`\n"
+            f"🛑 Stop Loss: `{cfg['stop_loss_pct']}%`\n"
+            f"🎯 Take Profit: `{cfg['take_profit_pct']}%`\n"
+            f"⏱️ Max tiempo en trade: `{cfg['max_minutos']} min`\n\n"
+            f"Para cambiar usa:\n"
+            f"`/set monto 5`\n"
+            f"`/set stop_loss 8`\n"
+            f"`/set take_profit 25`\n"
+            f"`/set max_minutos 45`"
+        )
+        await query.message.reply_text(texto, parse_mode="Markdown")
 
     elif data == "iniciar":
         if ctx.bot_data.get("corriendo"):
