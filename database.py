@@ -1,22 +1,28 @@
 """
 database.py — Almacenamiento local con SQLite (sin servidor, sin costo)
 Guarda: wallets seguidas, trades ejecutados, configuración del bot
+Las wallets también se respaldan en variable de entorno para sobrevivir deploys
 """
 
 import sqlite3
 import logging
+import os
+import json
 from datetime import datetime
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
-DB_PATH = "whale_bot.db"
+# Usar /tmp en Railway para que persista entre reinicios del mismo deploy
+# Si existe la variable DB_PATH en entorno, usarla (para Railway Volumes)
+DB_PATH = os.getenv("DB_PATH", "/tmp/whale_bot.db")
 
 
 class Database:
     def __init__(self, path: str = DB_PATH):
         self.path = path
         self._inicializar()
+        self._restaurar_wallets_desde_env()
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -60,16 +66,59 @@ class Database:
 
             # Configuración por defecto
             defaults = {
-                "monto_usd":       "10",
-                "stop_loss_pct":   "10",
-                "take_profit_pct": "20",
-                "max_minutos":     "60",
+                "monto_usd":       "5",
+                "stop_loss_pct":   "8",
+                "take_profit_pct": "25",
+                "max_minutos":     "45",
             }
             for clave, valor in defaults.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO config (clave, valor) VALUES (?, ?)",
                     (clave, valor)
                 )
+        log.info(f"Base de datos inicializada en {self.path}")
+
+    # ── RESPALDO DE WALLETS EN VARIABLE DE ENTORNO ────────────────────────────
+
+    def _restaurar_wallets_desde_env(self):
+        """
+        Al iniciar, si la DB está vacía pero hay wallets guardadas en
+        la variable WALLETS_BACKUP, las restaura automáticamente.
+        Esto evita perder las wallets en cada deploy de Railway.
+        """
+        wallets_actuales = self.obtener_wallets()
+        if wallets_actuales:
+            return  # Ya hay wallets, no restaurar
+
+        backup = os.getenv("WALLETS_BACKUP", "")
+        if not backup:
+            return
+
+        try:
+            wallets = json.loads(backup)
+            for address in wallets:
+                self.agregar_wallet(address)
+            log.info(f"✅ {len(wallets)} wallets restauradas desde WALLETS_BACKUP")
+        except Exception as e:
+            log.warning(f"No se pudo restaurar wallets desde env: {e}")
+
+    def _guardar_wallets_en_env(self):
+        """
+        Guarda las wallets actuales como JSON en WALLETS_BACKUP.
+        Se llama automáticamente cuando se agrega o quita una wallet.
+        NOTA: Esto actualiza la variable en memoria. Para persistir entre
+        deploys, hay que actualizar la variable en Railway manualmente
+        o usar el comando /backup en el bot.
+        """
+        try:
+            wallets = [w["address"] for w in self.obtener_wallets()]
+            backup  = json.dumps(wallets)
+            os.environ["WALLETS_BACKUP"] = backup
+            log.info(f"Wallets respaldadas en memoria: {len(wallets)}")
+            return backup
+        except Exception as e:
+            log.warning(f"Error respaldando wallets: {e}")
+            return ""
         log.info("Base de datos inicializada")
 
     # ── WALLETS ──────────────────────────────────────────────────────────────
@@ -77,11 +126,15 @@ class Database:
     def agregar_wallet(self, address: str):
         with self._conn() as conn:
             conn.execute("INSERT OR IGNORE INTO wallets (address) VALUES (?)", (address,))
+        self._guardar_wallets_en_env()
 
     def quitar_wallet(self, address: str) -> bool:
         with self._conn() as conn:
             cur = conn.execute("DELETE FROM wallets WHERE address = ?", (address,))
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+        if deleted:
+            self._guardar_wallets_en_env()
+        return deleted
 
     def wallet_existe(self, address: str) -> bool:
         with self._conn() as conn:
