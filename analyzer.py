@@ -79,24 +79,45 @@ class WalletAnalyzer:
         """
         log.info(f"Analizando wallet: {wallet[:12]}...")
 
-        # Obtener hasta 100 transacciones recientes
-        sigs = await self._rpc_call(
-            "getSignaturesForAddress",
-            [wallet, {"limit": 100}]
-        ) or []
+        # Obtener hasta 1000 transacciones en lotes de 250
+        todas_sigs = []
+        ultimo = None
 
-        if not sigs:
+        for _ in range(4):  # máximo 4 lotes = 1000 transacciones
+            params = {"limit": 250}
+            if ultimo:
+                params["before"] = ultimo
+
+            lote = await self._rpc_call(
+                "getSignaturesForAddress",
+                [wallet, params]
+            ) or []
+
+            if not lote:
+                break
+
+            todas_sigs.extend(lote)
+            ultimo = lote[-1].get("signature")
+
+            # Si el último del lote ya es de hace más de 90 días, paramos
+            hace_90_dias = int(time.time()) - (90 * 24 * 3600)
+            if (lote[-1].get("blockTime") or 0) < hace_90_dias:
+                break
+
+            await asyncio.sleep(0.3)  # pausa entre lotes
+
+        if not todas_sigs:
             return self._resultado_vacio(wallet, "Sin historial de transacciones")
 
         # Filtrar solo los últimos 90 días
         hace_90_dias = int(time.time()) - (90 * 24 * 3600)
-        sigs_recientes = [s for s in sigs if (s.get("blockTime") or 0) >= hace_90_dias]
+        sigs_recientes = [s for s in todas_sigs if (s.get("blockTime") or 0) >= hace_90_dias]
 
         if len(sigs_recientes) < 5:
             return self._resultado_vacio(wallet, "Muy poca actividad reciente (menos de 5 trades)")
 
-        # Analizar cada transacción
-        trades = await self._procesar_transacciones(sigs_recientes[:50])  # max 50 para no tardar mucho
+        # Analizar hasta 100 transacciones para no tardar demasiado
+        trades = await self._procesar_transacciones(sigs_recientes[:100])
 
         if not trades:
             return self._resultado_vacio(wallet, "No se detectaron trades en DEX conocidos")
