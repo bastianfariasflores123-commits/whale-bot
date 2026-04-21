@@ -1,18 +1,57 @@
 """
-analyzer.py — Analiza wallets usando GMGN como fuente principal
-GMGN tiene datos pre-calculados: win rate exacto, PnL en USD, historial completo
-Si GMGN falla, cae a análisis on-chain como respaldo
+analyzer.py — Analiza wallets usando la API oficial de GMGN
+Requiere GMGN_API_KEY en .env (gratuita en https://gmgn.ai/developer)
+Si GMGN falla, cae a análisis on-chain como respaldo.
 """
 
 import asyncio
 import aiohttp
 import logging
+import os
 import time
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# RPCs públicas de Solana (respaldo)
+# ── Configuración ─────────────────────────────────────────────────────────────
+
+GMGN_API_KEY = os.getenv("GMGN_API_KEY", "")
+
+# Endpoints oficiales de GMGN (actualizados 2025)
+# Documentación: https://gmgn.ai/developer
+GMGN_ENDPOINTS = {
+    # Estadísticas globales de la wallet (win rate, PnL, trades)
+    "wallet_stat": "https://gmgn.ai/api/v1/wallet_stat/sol/{wallet}?period={period}",
+    # Actividad reciente (lista de trades)
+    "wallet_activity": "https://gmgn.ai/api/v1/wallet_activity/sol/{wallet}?limit=100",
+    # Smart money profile (alternativo)
+    "smart_money": "https://gmgn.ai/api/v1/smartmoney/sol/walletNew/{wallet}?period={period}",
+    # Endpoint de la UI (puede fallar con bloqueos anti-bot)
+    "defi_stat": "https://gmgn.ai/defi/quotation/v1/wallet_stat/sol/{wallet}?period={period}",
+}
+
+# Periodos disponibles en GMGN
+PERIODOS = ["7d", "30d"]
+
+# Headers que imitan el navegador + API key si está disponible
+def _build_headers() -> dict:
+    h = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Referer":         "https://gmgn.ai/",
+        "Origin":          "https://gmgn.ai",
+    }
+    if GMGN_API_KEY:
+        h["Authorization"] = f"Bearer {GMGN_API_KEY}"
+        h["X-API-Key"]     = GMGN_API_KEY
+    return h
+
+# RPCs públicas de Solana (respaldo on-chain)
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://solana-api.projectserum.com",
@@ -40,14 +79,6 @@ DEX_PROGRAMAS = {
     "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJejpH":  "Openbook",
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Referer": "https://gmgn.ai/",
-    "Origin": "https://gmgn.ai",
-}
-
 
 class WalletAnalyzer:
     def __init__(self):
@@ -56,7 +87,7 @@ class WalletAnalyzer:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(headers=HEADERS)
+            self.session = aiohttp.ClientSession(headers=_build_headers())
         return self.session
 
     def _rpc(self) -> str:
@@ -65,7 +96,7 @@ class WalletAnalyzer:
         return url
 
     async def _rpc_call(self, method: str, params: list) -> Optional[any]:
-        s = await self._get_session()
+        s       = await self._get_session()
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         for _ in range(len(SOLANA_RPC_URLS)):
             try:
@@ -83,62 +114,188 @@ class WalletAnalyzer:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _obtener_datos_gmgn(self, wallet: str) -> Optional[dict]:
+        """
+        Intenta obtener datos de GMGN probando todos los endpoints y periodos.
+        Loguea exactamente qué status devuelve cada uno para facilitar debug.
+        """
         s = await self._get_session()
-        endpoints = [
-            f"https://gmgn.ai/api/v1/wallet_stat/sol/{wallet}?period=30d",
-            f"https://gmgn.ai/defi/quotation/v1/wallet_stat/sol/{wallet}?period=30d",
-            f"https://gmgn.ai/api/v1/smartmoney/sol/walletNew/{wallet}?period=30d",
-        ]
-        for url in endpoints:
-            try:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        log.info(f"GMGN OK para {wallet[:12]}")
-                        return self._parsear_gmgn(data, wallet)
-            except Exception as e:
-                log.warning(f"GMGN falló: {e}")
+
+        for periodo in PERIODOS:
+            for nombre, template in GMGN_ENDPOINTS.items():
+                url = template.format(wallet=wallet, period=periodo)
+                try:
+                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        log.info(f"GMGN [{nombre}] {periodo} → HTTP {r.status}")
+
+                        if r.status == 403:
+                            # Bloqueado — probablemente necesita API key
+                            log.warning(
+                                "GMGN devuelve 403 (bloqueado). "
+                                "Agrega GMGN_API_KEY en tu .env para acceso oficial. "
+                                "Regístrate gratis en https://gmgn.ai/developer"
+                            )
+                            continue
+
+                        if r.status == 429:
+                            log.warning("GMGN rate limit — esperando 3 segundos...")
+                            await asyncio.sleep(3)
+                            continue
+
+                        if r.status != 200:
+                            log.warning(f"GMGN [{nombre}] status inesperado: {r.status}")
+                            continue
+
+                        # Intentar parsear JSON
+                        try:
+                            data = await r.json(content_type=None)
+                        except Exception as e:
+                            log.warning(f"GMGN [{nombre}] respuesta no es JSON válido: {e}")
+                            continue
+
+                        resultado = self._parsear_gmgn(data, wallet)
+                        if resultado:
+                            log.info(
+                                f"✅ GMGN OK — endpoint={nombre} periodo={periodo} "
+                                f"wallet={wallet[:12]}..."
+                            )
+                            return resultado
+                        else:
+                            log.warning(
+                                f"GMGN [{nombre}] respondió 200 pero datos insuficientes "
+                                f"(wallet sin historial suficiente o campos no reconocidos)"
+                            )
+
+                except asyncio.TimeoutError:
+                    log.warning(f"GMGN [{nombre}] timeout")
+                except Exception as e:
+                    log.warning(f"GMGN [{nombre}] error: {e}")
+
+            await asyncio.sleep(0.5)  # pausa entre periodos
+
+        log.warning(
+            f"GMGN no devolvió datos útiles para {wallet[:12]}... "
+            f"API key configurada: {'Sí' if GMGN_API_KEY else 'No'}"
+        )
         return None
 
     def _parsear_gmgn(self, data: dict, wallet: str) -> Optional[dict]:
+        """
+        Parsea la respuesta de GMGN, intentando múltiples estructuras posibles
+        porque GMGN cambia los nombres de campo entre versiones.
+        """
         try:
-            info = data.get("data") or data.get("wallet") or data.get("result") or data
-            if not info:
+            # GMGN puede meter los datos en distintas claves según el endpoint
+            info = (
+                data.get("data")
+                or data.get("wallet")
+                or data.get("result")
+                or data.get("stat")
+                or data
+            )
+
+            if not info or not isinstance(info, dict):
                 return None
 
-            win_rate = float(info.get("winrate") or info.get("win_rate") or info.get("winRate") or 0)
-            if win_rate <= 1:
+            # ── Win rate ──────────────────────────────────────────────────────
+            win_rate = float(
+                info.get("winrate")
+                or info.get("win_rate")
+                or info.get("winRate")
+                or info.get("profit_num", 0)  # algunos endpoints mandan la cuenta
+                or 0
+            )
+            # GMGN a veces devuelve 0.65 (porcentaje decimal) y a veces 65.0
+            if 0 < win_rate <= 1:
                 win_rate = win_rate * 100
 
-            total_trades = int(info.get("total_trade_count") or info.get("totalTradeCount") or info.get("trade_count") or 0)
-            ganados      = int(info.get("win_count") or info.get("winCount") or info.get("profit_count") or 0)
-            perdidos     = total_trades - ganados
+            # ── Conteo de trades ──────────────────────────────────────────────
+            total_trades = int(
+                info.get("total_trade_count")
+                or info.get("totalTradeCount")
+                or info.get("trade_count")
+                or info.get("buy_count", 0)
+                or 0
+            )
+            ganados = int(
+                info.get("win_count")
+                or info.get("winCount")
+                or info.get("profit_count")
+                or 0
+            )
 
-            pnl_usd    = float(info.get("realized_profit") or info.get("realizedProfit") or info.get("total_profit_usd") or 0)
-            avg_profit = float(info.get("avg_profit_usd") or info.get("avgProfitUsd") or 0)
-            avg_loss   = float(info.get("avg_loss_usd") or info.get("avgLossUsd") or 0)
+            # Recalcular ganados si win_rate está disponible y win_count no
+            if total_trades > 0 and ganados == 0 and win_rate > 0:
+                ganados = int(total_trades * win_rate / 100)
 
-            profit_factor = abs(avg_profit / avg_loss) if avg_loss and avg_loss != 0 else avg_profit
+            perdidos = total_trades - ganados
 
-            first_trade   = info.get("first_active_timestamp") or info.get("firstActiveTimestamp") or 0
-            dias_activo   = min(int((time.time() - first_trade) / 86400), 365) if first_trade else 30
+            # ── PnL y promedios ───────────────────────────────────────────────
+            pnl_usd = float(
+                info.get("realized_profit")
+                or info.get("realizedProfit")
+                or info.get("total_profit_usd")
+                or info.get("pnl")
+                or 0
+            )
+            avg_profit = float(
+                info.get("avg_profit_usd")
+                or info.get("avgProfitUsd")
+                or info.get("avg_profit")
+                or 0
+            )
+            avg_loss = float(
+                info.get("avg_loss_usd")
+                or info.get("avgLossUsd")
+                or info.get("avg_loss")
+                or 0
+            )
+            profit_factor = (
+                abs(avg_profit / avg_loss) if avg_loss and avg_loss != 0 else avg_profit
+            )
+
+            # ── Actividad temporal ────────────────────────────────────────────
+            first_trade = (
+                info.get("first_active_timestamp")
+                or info.get("firstActiveTimestamp")
+                or info.get("start_timestamp")
+                or 0
+            )
+            dias_activo    = min(int((time.time() - first_trade) / 86400), 365) if first_trade else 30
             trades_por_dia = total_trades / max(dias_activo, 1)
-            tokens_unicos  = int(info.get("token_num") or info.get("tokenNum") or 0)
 
-            if total_trades < 5 or win_rate == 0:
+            tokens_unicos = int(
+                info.get("token_num")
+                or info.get("tokenNum")
+                or info.get("token_count")
+                or 0
+            )
+
+            # ── Validación mínima ─────────────────────────────────────────────
+            if total_trades < 5:
+                log.info(f"GMGN: wallet con menos de 5 trades ({total_trades}), ignorando")
+                return None
+            if win_rate == 0 and pnl_usd == 0:
+                log.info("GMGN: win_rate y pnl ambos en 0, datos insuficientes")
                 return None
 
             return {
-                "fuente": "GMGN", "wallet": wallet,
-                "win_rate": round(win_rate, 1), "total_trades": total_trades,
-                "ganados": ganados, "perdidos": perdidos,
-                "pnl_usd": round(pnl_usd, 2), "avg_profit_usd": round(avg_profit, 2),
-                "avg_loss_usd": round(avg_loss, 2), "profit_factor": round(profit_factor, 2),
-                "dias_activo": dias_activo, "trades_por_dia": round(trades_por_dia, 1),
-                "tokens_unicos": tokens_unicos,
+                "fuente":          "GMGN",
+                "wallet":          wallet,
+                "win_rate":        round(win_rate, 1),
+                "total_trades":    total_trades,
+                "ganados":         ganados,
+                "perdidos":        perdidos,
+                "pnl_usd":         round(pnl_usd, 2),
+                "avg_profit_usd":  round(avg_profit, 2),
+                "avg_loss_usd":    round(avg_loss, 2),
+                "profit_factor":   round(profit_factor, 2),
+                "dias_activo":     dias_activo,
+                "trades_por_dia":  round(trades_por_dia, 1),
+                "tokens_unicos":   tokens_unicos,
             }
+
         except Exception as e:
-            log.error(f"Error parseando GMGN: {e}")
+            log.error(f"Error parseando respuesta GMGN: {e}")
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -146,45 +303,55 @@ class WalletAnalyzer:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def analizar(self, wallet: str) -> dict:
-        log.info(f"Analizando wallet: {wallet[:12]}...")
+        log.info(f"Analizando wallet: {wallet[:12]}... (API key GMGN: {'✅' if GMGN_API_KEY else '❌ no configurada'})")
 
-        # Intento 1: GMGN (5-10 segundos)
+        # Intento 1: GMGN (preciso, rápido, pre-calculado)
         datos_gmgn = await self._obtener_datos_gmgn(wallet)
         if datos_gmgn:
             log.info(f"Usando datos GMGN para {wallet[:12]}")
             return self._calcular_score_gmgn(wallet, datos_gmgn)
 
-        # Intento 2: On-chain (respaldo)
-        log.info(f"Usando análisis on-chain para {wallet[:12]}")
+        # Intento 2: On-chain RPC (respaldo lento pero sin depender de GMGN)
+        log.info(f"GMGN no disponible → analizando on-chain para {wallet[:12]}")
         return await self._analizar_onchain(wallet)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  ANÁLISIS ON-CHAIN (respaldo)
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def _analizar_onchain(self, wallet: str) -> dict:
         todas_sigs = []
-        ultimo = None
+        ultimo     = None
+
         for _ in range(4):
             params = {"limit": 250}
             if ultimo:
                 params["before"] = ultimo
+
             lote = await self._rpc_call("getSignaturesForAddress", [wallet, params]) or []
             if not lote:
                 break
+
             todas_sigs.extend(lote)
-            ultimo = lote[-1].get("signature")
+            ultimo  = lote[-1].get("signature")
             hace_90 = int(time.time()) - (90 * 24 * 3600)
+
             if (lote[-1].get("blockTime") or 0) < hace_90:
                 break
+
             await asyncio.sleep(0.3)
 
         if not todas_sigs:
             return self._resultado_vacio(wallet, "Sin historial de transacciones")
 
-        hace_90 = int(time.time()) - (90 * 24 * 3600)
+        hace_90       = int(time.time()) - (90 * 24 * 3600)
         sigs_recientes = [s for s in todas_sigs if (s.get("blockTime") or 0) >= hace_90]
 
         if len(sigs_recientes) < 5:
             return self._resultado_vacio(wallet, "Muy poca actividad reciente")
 
         trades = await self._procesar_transacciones(sigs_recientes[:100])
+
         if not trades:
             return self._resultado_vacio(wallet, "No se detectaron trades en DEX conocidos")
 
@@ -193,7 +360,7 @@ class WalletAnalyzer:
     async def _procesar_transacciones(self, sigs: list) -> list:
         trades = []
         for i in range(0, len(sigs), 10):
-            lote    = sigs[i:i+10]
+            lote    = sigs[i:i + 10]
             tareas  = [self._analizar_tx(s["signature"], s.get("blockTime", 0)) for s in lote]
             results = await asyncio.gather(*tareas, return_exceptions=True)
             for r in results:
@@ -204,63 +371,111 @@ class WalletAnalyzer:
 
     async def _analizar_tx(self, signature: str, block_time: int) -> Optional[dict]:
         try:
-            tx_data = await self._rpc_call("getTransaction", [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+            tx_data = await self._rpc_call(
+                "getTransaction",
+                [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            )
             if not tx_data:
                 return None
+
             meta    = tx_data.get("meta", {})
             message = tx_data.get("transaction", {}).get("message", {})
+
             if meta.get("err"):
                 return None
+
             account_keys = message.get("accountKeys", [])
             es_dex = any(
-                (key_info.get("pubkey", "") if isinstance(key_info, dict) else str(key_info)) in DEX_PROGRAMAS
+                (key_info.get("pubkey", "") if isinstance(key_info, dict) else str(key_info))
+                in DEX_PROGRAMAS
                 for key_info in account_keys
             )
             if not es_dex:
                 return None
+
             pre_sol   = sum(meta.get("preBalances",  [0])[:5]) / 1e9
             post_sol  = sum(meta.get("postBalances", [0])[:5]) / 1e9
             fee_sol   = meta.get("fee", 0) / 1e9
             delta_sol = (post_sol - pre_sol) + fee_sol
-            pre_map   = {b["mint"]: float(b["uiTokenAmount"]["uiAmount"] or 0) for b in meta.get("preTokenBalances", [])}
-            post_map  = {b["mint"]: float(b["uiTokenAmount"]["uiAmount"] or 0) for b in meta.get("postTokenBalances", [])}
-            token_principal = next((m for m in (set(pre_map) | set(post_map)) if m not in (SOL_MINT, USDC_MINT)), None)
-            return {"signature": signature, "timestamp": block_time, "delta_sol": round(delta_sol, 6), "es_ganancia": delta_sol > 0, "token_mint": token_principal}
+
+            pre_map  = {b["mint"]: float(b["uiTokenAmount"]["uiAmount"] or 0)
+                        for b in meta.get("preTokenBalances", [])}
+            post_map = {b["mint"]: float(b["uiTokenAmount"]["uiAmount"] or 0)
+                        for b in meta.get("postTokenBalances", [])}
+
+            token_principal = next(
+                (m for m in (set(pre_map) | set(post_map))
+                 if m not in (SOL_MINT, USDC_MINT)),
+                None
+            )
+
+            return {
+                "signature":   signature,
+                "timestamp":   block_time,
+                "delta_sol":   round(delta_sol, 6),
+                "es_ganancia": delta_sol > 0,
+                "token_mint":  token_principal,
+            }
+
         except Exception as e:
             log.debug(f"Error TX {signature[:12]}: {e}")
             return None
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  CÁLCULO DE SCORE
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _calcular_score_gmgn(self, wallet: str, d: dict) -> dict:
         score = 0.0
-        if d["win_rate"] >= 65:      score += 3.0
-        elif d["win_rate"] >= 55:    score += 2.0
-        elif d["win_rate"] >= 45:    score += 1.0
-        if d["profit_factor"] >= 2:  score += 2.0
-        elif d["profit_factor"] >= 1.5: score += 1.5
-        elif d["profit_factor"] >= 1:   score += 1.0
-        if d["total_trades"] >= 40:  score += 2.0
+
+        # Win rate (max 3 pts)
+        if d["win_rate"] >= 65:     score += 3.0
+        elif d["win_rate"] >= 55:   score += 2.0
+        elif d["win_rate"] >= 45:   score += 1.0
+
+        # Profit factor (max 2 pts)
+        if d["profit_factor"] >= 2:      score += 2.0
+        elif d["profit_factor"] >= 1.5:  score += 1.5
+        elif d["profit_factor"] >= 1:    score += 1.0
+
+        # Volumen de trades (max 2 pts)
+        if d["total_trades"] >= 40:   score += 2.0
         elif d["total_trades"] >= 20: score += 1.5
         elif d["total_trades"] >= 10: score += 1.0
-        if d["trades_por_dia"] <= 10:  score += 2.0
+
+        # Frecuencia razonable (max 2 pts — penaliza bots)
+        if d["trades_por_dia"] <= 10:   score += 2.0
         elif d["trades_por_dia"] <= 20: score += 1.0
-        if d["pnl_usd"] > 0:         score += 1.0
+
+        # PnL positivo (1 pt)
+        if d["pnl_usd"] > 0:  score += 1.0
+
         score = min(round(score, 1), 10.0)
-        if score >= 7.5:
-            rec, emoji = "✅ MUY RECOMENDADA — excelente historial", "🟢"
-        elif score >= 5.5:
-            rec, emoji = "🟡 ACEPTABLE — úsala con precaución", "🟡"
-        else:
-            rec, emoji = "🔴 NO RECOMENDADA — historial débil", "🔴"
+
+        if score >= 7.5:    rec, emoji = "✅ MUY RECOMENDADA — excelente historial", "🟢"
+        elif score >= 5.5:  rec, emoji = "🟡 ACEPTABLE — úsala con precaución",      "🟡"
+        else:               rec, emoji = "🔴 NO RECOMENDADA — historial débil",       "🔴"
+
         return {
-            "wallet": wallet, "fuente": "GMGN ✨", "score": score,
-            "emoji_score": emoji, "recomendacion": rec,
-            "win_rate": d["win_rate"], "total_trades": d["total_trades"],
-            "ganados": d["ganados"], "perdidos": d["perdidos"],
-            "avg_ganancia_sol": d["avg_profit_usd"], "avg_perdida_sol": d["avg_loss_usd"],
-            "profit_factor": d["profit_factor"], "pnl_total_sol": d["pnl_usd"],
-            "trades_por_dia": d["trades_por_dia"], "tokens_unicos": d["tokens_unicos"],
-            "dias_analizados": d["dias_activo"], "es_bot": d["trades_por_dia"] > 50,
-            "error": None, "pnl_en_usd": True,
+            "wallet":           wallet,
+            "fuente":           "GMGN ✨",
+            "score":            score,
+            "emoji_score":      emoji,
+            "recomendacion":    rec,
+            "win_rate":         d["win_rate"],
+            "total_trades":     d["total_trades"],
+            "ganados":          d["ganados"],
+            "perdidos":         d["perdidos"],
+            "avg_ganancia_sol": d["avg_profit_usd"],
+            "avg_perdida_sol":  d["avg_loss_usd"],
+            "profit_factor":    d["profit_factor"],
+            "pnl_total_sol":    d["pnl_usd"],
+            "trades_por_dia":   d["trades_por_dia"],
+            "tokens_unicos":    d["tokens_unicos"],
+            "dias_analizados":  d["dias_activo"],
+            "es_bot":           d["trades_por_dia"] > 50,
+            "error":            None,
+            "pnl_en_usd":       True,
         }
 
     def _calcular_metricas(self, wallet: str, trades: list, total_sigs: int) -> dict:
@@ -268,58 +483,87 @@ class WalletAnalyzer:
         ganados    = [t for t in trades if t["es_ganancia"]]
         perdidos_l = [t for t in trades if not t["es_ganancia"]]
         win_rate   = (len(ganados) / total * 100) if total else 0
-        ganancias  = [t["delta_sol"] for t in ganados]
-        perdidas   = [abs(t["delta_sol"]) for t in perdidos_l]
-        avg_g      = sum(ganancias) / len(ganancias) if ganancias else 0
-        avg_p      = sum(perdidas)  / len(perdidas)  if perdidas  else 0
-        pf         = (avg_g / avg_p) if avg_p > 0 else avg_g
-        pnl        = sum(t["delta_sol"] for t in trades)
+
+        ganancias = [t["delta_sol"] for t in ganados]
+        perdidas  = [abs(t["delta_sol"]) for t in perdidos_l]
+        avg_g     = sum(ganancias) / len(ganancias) if ganancias else 0
+        avg_p     = sum(perdidas)  / len(perdidas)  if perdidas  else 0
+        pf        = (avg_g / avg_p) if avg_p > 0 else avg_g
+        pnl       = sum(t["delta_sol"] for t in trades)
+
         timestamps = sorted([t["timestamp"] for t in trades if t["timestamp"]])
         es_bot     = False
         if len(timestamps) > 10:
-            intervalos    = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-            es_bot        = (sum(intervalos) / len(intervalos)) < 10
+            intervalos = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
+            es_bot     = (sum(intervalos) / len(intervalos)) < 10
+
         rango_dias     = (timestamps[-1] - timestamps[0]) / 86400 if timestamps else 0
         trades_por_dia = total / max(rango_dias, 1)
+
         score = 0.0
-        if win_rate >= 65:      score += 3.0
-        elif win_rate >= 55:    score += 2.0
-        elif win_rate >= 45:    score += 1.0
-        if pf >= 2:             score += 2.0
-        elif pf >= 1.5:         score += 1.5
-        elif pf >= 1:           score += 1.0
-        if total >= 40:         score += 2.0
-        elif total >= 20:       score += 1.5
-        elif total >= 10:       score += 1.0
+        if win_rate >= 65:     score += 3.0
+        elif win_rate >= 55:   score += 2.0
+        elif win_rate >= 45:   score += 1.0
+        if pf >= 2:            score += 2.0
+        elif pf >= 1.5:        score += 1.5
+        elif pf >= 1:          score += 1.0
+        if total >= 40:        score += 2.0
+        elif total >= 20:      score += 1.5
+        elif total >= 10:      score += 1.0
         if not es_bot:
             score += 2.0 if trades_por_dia <= 10 else 1.0
-        if pnl > 0:             score += 1.0
+        if pnl > 0:            score += 1.0
+
         score = min(round(score, 1), 10.0)
-        if es_bot:              rec, emoji = "⛔ NO RECOMENDADA — posible bot", "🔴"
-        elif score >= 7.5:      rec, emoji = "✅ MUY RECOMENDADA — excelente historial", "🟢"
-        elif score >= 5.5:      rec, emoji = "🟡 ACEPTABLE — úsala con precaución", "🟡"
-        else:                   rec, emoji = "🔴 NO RECOMENDADA — historial débil", "🔴"
+
+        if es_bot:            rec, emoji = "⛔ NO RECOMENDADA — posible bot",         "🔴"
+        elif score >= 7.5:    rec, emoji = "✅ MUY RECOMENDADA — excelente historial", "🟢"
+        elif score >= 5.5:    rec, emoji = "🟡 ACEPTABLE — úsala con precaución",      "🟡"
+        else:                 rec, emoji = "🔴 NO RECOMENDADA — historial débil",       "🔴"
+
         return {
-            "wallet": wallet, "fuente": "On-chain", "score": score,
-            "emoji_score": emoji, "recomendacion": rec,
-            "win_rate": round(win_rate, 1), "total_trades": total,
-            "ganados": len(ganados), "perdidos": len(perdidos_l),
-            "avg_ganancia_sol": round(avg_g, 4), "avg_perdida_sol": round(avg_p, 4),
-            "profit_factor": round(pf, 2), "pnl_total_sol": round(pnl, 4),
-            "trades_por_dia": round(trades_por_dia, 1),
-            "tokens_unicos": len(set(t["token_mint"] for t in trades if t["token_mint"])),
-            "dias_analizados": round(rango_dias), "es_bot": es_bot,
-            "error": None, "pnl_en_usd": False,
+            "wallet":           wallet,
+            "fuente":           "On-chain",
+            "score":            score,
+            "emoji_score":      emoji,
+            "recomendacion":    rec,
+            "win_rate":         round(win_rate, 1),
+            "total_trades":     total,
+            "ganados":          len(ganados),
+            "perdidos":         len(perdidos_l),
+            "avg_ganancia_sol": round(avg_g, 4),
+            "avg_perdida_sol":  round(avg_p, 4),
+            "profit_factor":    round(pf, 2),
+            "pnl_total_sol":    round(pnl, 4),
+            "trades_por_dia":   round(trades_por_dia, 1),
+            "tokens_unicos":    len(set(t["token_mint"] for t in trades if t["token_mint"])),
+            "dias_analizados":  round(rango_dias),
+            "es_bot":           es_bot,
+            "error":            None,
+            "pnl_en_usd":       False,
         }
 
     def _resultado_vacio(self, wallet: str, motivo: str) -> dict:
         return {
-            "wallet": wallet, "fuente": "N/A", "score": 0.0, "emoji_score": "⚫",
-            "recomendacion": f"❌ {motivo}", "win_rate": 0, "total_trades": 0,
-            "ganados": 0, "perdidos": 0, "avg_ganancia_sol": 0, "avg_perdida_sol": 0,
-            "profit_factor": 0, "pnl_total_sol": 0, "trades_por_dia": 0,
-            "tokens_unicos": 0, "dias_analizados": 0, "es_bot": False,
-            "error": motivo, "pnl_en_usd": False,
+            "wallet":           wallet,
+            "fuente":           "N/A",
+            "score":            0.0,
+            "emoji_score":      "⚫",
+            "recomendacion":    f"❌ {motivo}",
+            "win_rate":         0,
+            "total_trades":     0,
+            "ganados":          0,
+            "perdidos":         0,
+            "avg_ganancia_sol": 0,
+            "avg_perdida_sol":  0,
+            "profit_factor":    0,
+            "pnl_total_sol":    0,
+            "trades_por_dia":   0,
+            "tokens_unicos":    0,
+            "dias_analizados":  0,
+            "es_bot":           False,
+            "error":            motivo,
+            "pnl_en_usd":       False,
         }
 
     async def cerrar(self):
