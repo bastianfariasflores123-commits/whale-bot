@@ -10,16 +10,18 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# RPCs confiables y activos — se eliminó projectserum.com (muerto)
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
-    "https://solana-api.projectserum.com",
     "https://rpc.ankr.com/solana",
+    "https://solana-mainnet.g.alchemy.com/v2/demo",
+    "https://mainnet.helius-rpc.com/?api-key=demo",
 ]
 
 DEX_PROGRAMAS = {
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "Jupiter",
     "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB":  "Jupiter v4",
-    "JUP3c2Uh3WA4Ng34tw6kPd2G4LFvdpUtkzEgBAWUdT":  "Jupiter v3",
+    "JUP3c2Uh3WA4Ng34tw6kpd2G4LFvdpUtkzEgBAWUdT":  "Jupiter v3",
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "Raydium AMM",
     "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h": "Raydium AMM v2",
     "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": "Raydium CLMM",
@@ -65,7 +67,7 @@ class WalletMonitor:
                         data = await r.json()
                         return data.get("result")
             except Exception as e:
-                log.warning(f"RPC {url[:30]} falló: {e}")
+                log.warning(f"RPC {url[:40]} falló: {e}")
         return None
 
     async def obtener_transacciones_nuevas(self, wallet_address: str, ya_procesadas: set) -> list:
