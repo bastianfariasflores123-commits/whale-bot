@@ -530,6 +530,29 @@ def _grafico_dias(ganancias_por_dia: dict) -> str:
 
 
 @solo_autorizado
+async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra el string de wallets para guardar en Railway."""
+    import json
+    wallets = db.obtener_wallets()
+    if not wallets:
+        await update.message.reply_text("No tienes wallets guardadas aún.")
+        return
+
+    addresses = [w["address"] for w in wallets]
+    backup    = json.dumps(addresses)
+
+    texto = (
+        "💾 *Backup de tus wallets*\n\n"
+        "Para que sobrevivan los deploys, copia este valor y "
+        "agrégalo en Railway como variable de entorno:\n\n"
+        f"*Nombre:* `WALLETS_BACKUP`\n"
+        f"*Valor:*\n`{backup}`\n\n"
+        "Railway → Variables → Nueva variable → pega el nombre y valor → Save"
+    )
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+
+@solo_autorizado
 async def cmd_quitar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Uso: `/quitar <wallet_address>`", parse_mode="Markdown")
@@ -708,10 +731,24 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Corre cada 15 segundos. Revisa cada wallet en busca de nuevas transacciones.
-    Si detecta una compra, ejecuta el trade con la cantidad configurada.
+    Corre cada 15 segundos. Revisa las últimas 10 TXs de cada wallet
+    para no perder ningún trade aunque la ballena opere rápido.
     """
     log.info("🔄 Loop de monitoreo iniciado")
+
+    # Notificar estado del trader al arrancar
+    if trader.esta_listo():
+        await ctx.bot.send_message(
+            chat_id    = AUTHORIZED_USER,
+            text       = f"✅ *Bot iniciado correctamente*\n\n💼 Wallet: `{trader.pubkey_str[:12]}...`\n🐋 Monitoreando {len(db.obtener_wallets(solo_activas=True))} wallets",
+            parse_mode = "Markdown"
+        )
+    else:
+        await ctx.bot.send_message(
+            chat_id    = AUTHORIZED_USER,
+            text       = "⚠️ *Bot iniciado en modo simulación*\n\nNo se pudo cargar la wallet. Verifica SOLANA_PRIVATE_KEY en Railway.",
+            parse_mode = "Markdown"
+        )
 
     while ctx.bot_data.get("corriendo"):
         wallets = db.obtener_wallets(solo_activas=True)
@@ -719,30 +756,38 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
         for w in wallets:
             try:
-                tx = await monitor.ultima_transaccion(w["address"])
-                if tx and not db.tx_procesada(tx["signature"]):
-                    log.info(f"Nueva TX detectada: {tx['signature'][:20]}...")
+                # Obtener todas las TXs procesadas para esta sesión
+                txs_nuevas = await monitor.obtener_transacciones_nuevas(
+                    w["address"],
+                    ya_procesadas=set()  # El filtro se hace en db.tx_procesada
+                )
 
-                    # Intentar copiar el trade
+                for tx in txs_nuevas:
+                    if db.tx_procesada(tx["signature"]):
+                        continue
+
+                    log.info(f"🎯 Nueva TX: {tx['signature'][:20]} | {tx['accion']} | {tx['dex']}")
+
+                    # Marcar primero para evitar doble ejecución
+                    db.marcar_tx(tx["signature"])
+
+                    # Ejecutar trade
                     resultado = await trader.copiar_trade(
-                        token_mint   = tx["token_mint"],
-                        accion       = tx["accion"],      # "compra" | "venta"
-                        monto_usd    = cfg["monto_usd"],
-                        stop_loss    = cfg["stop_loss_pct"],
-                        take_profit  = cfg["take_profit_pct"],
-                        max_minutos  = cfg["max_minutos"],
+                        token_mint  = tx["token_mint"],
+                        accion      = tx["accion"],
+                        monto_usd   = cfg["monto_usd"],
+                        stop_loss   = cfg["stop_loss_pct"],
+                        take_profit = cfg["take_profit_pct"],
+                        max_minutos = cfg["max_minutos"],
                     )
 
-                    db.marcar_tx(tx["signature"])
                     db.registrar_trade(resultado)
-
-                    # Notificar al usuario
                     await notificar_resultado(ctx, tx, resultado)
 
             except Exception as e:
                 log.error(f"Error procesando wallet {w['address'][:8]}: {e}")
 
-        await asyncio.sleep(15)  # pausa entre ciclos
+        await asyncio.sleep(15)
 
     log.info("⏹️ Loop de monitoreo detenido")
 
@@ -797,6 +842,7 @@ def main():
     app.add_handler(CommandHandler("hoy",      cmd_hoy))
     app.add_handler(CommandHandler("semana",   cmd_semana))
     app.add_handler(CommandHandler("mes",      cmd_mes))
+    app.add_handler(CommandHandler("backup",   cmd_backup))
 
     # Botones inline
     app.add_handler(CallbackQueryHandler(callback_handler))
