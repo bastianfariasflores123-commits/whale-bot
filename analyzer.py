@@ -1,6 +1,7 @@
 """
-analyzer.py — Analiza wallets de Solana directamente on-chain
-Próximamente: integración con Helius API para análisis más rápido y preciso
+analyzer.py — Analiza wallets de Solana
+Fuente principal: Helius API (rápido, 3-5s)
+Respaldo: On-chain RPC (limitado a 50 TXs para no tardar)
 """
 
 import asyncio
@@ -12,10 +13,8 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# ── Helius API (agregar key en .env cuando esté lista) ───────────────────────
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 
-# ── RPCs públicas de Solana ───────────────────────────────────────────────────
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://solana-api.projectserum.com",
@@ -65,7 +64,7 @@ class WalletAnalyzer:
         for _ in range(len(SOLANA_RPC_URLS)):
             try:
                 async with s.post(self._rpc(), json=payload,
-                                  timeout=aiohttp.ClientTimeout(total=12)) as r:
+                                  timeout=aiohttp.ClientTimeout(total=10)) as r:
                     if r.status == 200:
                         data = await r.json()
                         return data.get("result")
@@ -80,17 +79,15 @@ class WalletAnalyzer:
     async def analizar(self, wallet: str) -> dict:
         log.info(f"Analizando wallet: {wallet[:12]}...")
 
-        # Helius se activa automático cuando pongas la key en .env
         if HELIUS_API_KEY:
-            log.info("Helius API key detectada — usando Helius ⚡")
+            log.info("Usando Helius ⚡")
             return await self._analizar_helius(wallet)
 
-        # Sin Helius: análisis directo on-chain (siempre funciona)
-        log.info("Usando análisis on-chain")
+        log.info("Sin Helius — usando on-chain (respaldo rápido)")
         return await self._analizar_onchain(wallet)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  HELIUS (se activa automático cuando pongas la key en .env)
+    #  HELIUS — fuente principal (3-5 segundos)
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _analizar_helius(self, wallet: str) -> dict:
@@ -105,7 +102,7 @@ class WalletAnalyzer:
             async with s.get(url, params=params,
                              timeout=aiohttp.ClientTimeout(total=20)) as r:
                 if r.status != 200:
-                    log.warning(f"Helius error {r.status} — cayendo a on-chain")
+                    log.warning(f"Helius error {r.status} — respaldo on-chain")
                     return await self._analizar_onchain(wallet)
 
                 txs = await r.json()
@@ -114,8 +111,11 @@ class WalletAnalyzer:
 
                 return self._procesar_helius(wallet, txs)
 
+        except asyncio.TimeoutError:
+            log.warning("Helius timeout — respaldo on-chain")
+            return await self._analizar_onchain(wallet)
         except Exception as e:
-            log.error(f"Helius falló: {e} — cayendo a on-chain")
+            log.error(f"Helius falló: {e} — respaldo on-chain")
             return await self._analizar_onchain(wallet)
 
     def _procesar_helius(self, wallet: str, txs: list) -> dict:
@@ -133,8 +133,8 @@ class WalletAnalyzer:
                 if not swap:
                     continue
 
-                native_input  = swap.get("nativeInput",  {})
-                native_output = swap.get("nativeOutput", {})
+                native_input  = swap.get("nativeInput",  {}) or {}
+                native_output = swap.get("nativeOutput", {}) or {}
                 sol_gastado   = (native_input.get("amount",  0) or 0) / 1e9
                 sol_recibido  = (native_output.get("amount", 0) or 0) / 1e9
                 delta_sol     = sol_recibido - sol_gastado
@@ -156,52 +156,37 @@ class WalletAnalyzer:
                 })
 
             except Exception as e:
-                log.debug(f"Error procesando TX Helius: {e}")
+                log.debug(f"Error TX Helius: {e}")
                 continue
 
         if not trades:
             return self._resultado_vacio(wallet, "No se detectaron swaps en los últimos 90 días")
 
-        resultado          = self._calcular_metricas(wallet, trades, len(txs))
+        resultado           = self._calcular_metricas(wallet, trades, len(txs))
         resultado["fuente"] = "Helius ⚡"
         return resultado
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  ON-CHAIN (funciona siempre, sin API key)
+    #  ON-CHAIN — respaldo rápido (máx 50 TXs, sin loops infinitos)
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _analizar_onchain(self, wallet: str) -> dict:
-        todas_sigs = []
-        ultimo     = None
+        # Solo 1 lote de 50 — suficiente para el análisis, no tarda minutos
+        lote = await self._rpc_call(
+            "getSignaturesForAddress",
+            [wallet, {"limit": 50}]
+        ) or []
 
-        for _ in range(4):
-            params = {"limit": 250}
-            if ultimo:
-                params["before"] = ultimo
-
-            lote = await self._rpc_call("getSignaturesForAddress", [wallet, params]) or []
-            if not lote:
-                break
-
-            todas_sigs.extend(lote)
-            ultimo  = lote[-1].get("signature")
-            hace_90 = int(time.time()) - (90 * 24 * 3600)
-
-            if (lote[-1].get("blockTime") or 0) < hace_90:
-                break
-
-            await asyncio.sleep(0.3)
-
-        if not todas_sigs:
+        if not lote:
             return self._resultado_vacio(wallet, "Sin historial de transacciones")
 
         hace_90        = int(time.time()) - (90 * 24 * 3600)
-        sigs_recientes = [s for s in todas_sigs if (s.get("blockTime") or 0) >= hace_90]
+        sigs_recientes = [s for s in lote if (s.get("blockTime") or 0) >= hace_90]
 
         if len(sigs_recientes) < 5:
-            return self._resultado_vacio(wallet, "Muy poca actividad reciente")
+            return self._resultado_vacio(wallet, "Muy poca actividad reciente (últimos 90 días)")
 
-        trades = await self._procesar_transacciones(sigs_recientes[:100])
+        trades = await self._procesar_transacciones(sigs_recientes[:50])
 
         if not trades:
             return self._resultado_vacio(wallet, "No se detectaron trades en DEX conocidos")
@@ -210,6 +195,7 @@ class WalletAnalyzer:
 
     async def _procesar_transacciones(self, sigs: list) -> list:
         trades = []
+        # Procesar en lotes de 10 en paralelo
         for i in range(0, len(sigs), 10):
             lote    = sigs[i:i + 10]
             tareas  = [self._analizar_tx(s["signature"], s.get("blockTime", 0)) for s in lote]
@@ -217,7 +203,7 @@ class WalletAnalyzer:
             for r in results:
                 if isinstance(r, dict) and r:
                     trades.append(r)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)  # pausa mínima entre lotes
         return trades
 
     async def _analizar_tx(self, signature: str, block_time: int) -> Optional[dict]:
