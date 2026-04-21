@@ -1,7 +1,6 @@
 """
-analyzer.py — Analiza wallets usando la API oficial de GMGN
-Requiere GMGN_API_KEY en .env (gratuita en https://gmgn.ai/developer)
-Si GMGN falla, cae a análisis on-chain como respaldo.
+analyzer.py — Analiza wallets de Solana directamente on-chain
+Próximamente: integración con Helius API para análisis más rápido y preciso
 """
 
 import asyncio
@@ -13,45 +12,10 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# ── Configuración ─────────────────────────────────────────────────────────────
+# ── Helius API (agregar key en .env cuando esté lista) ───────────────────────
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 
-GMGN_API_KEY = os.getenv("GMGN_API_KEY", "")
-
-# Endpoints oficiales de GMGN (actualizados 2025)
-# Documentación: https://gmgn.ai/developer
-GMGN_ENDPOINTS = {
-    # Estadísticas globales de la wallet (win rate, PnL, trades)
-    "wallet_stat": "https://gmgn.ai/api/v1/wallet_stat/sol/{wallet}?period={period}",
-    # Actividad reciente (lista de trades)
-    "wallet_activity": "https://gmgn.ai/api/v1/wallet_activity/sol/{wallet}?limit=100",
-    # Smart money profile (alternativo)
-    "smart_money": "https://gmgn.ai/api/v1/smartmoney/sol/walletNew/{wallet}?period={period}",
-    # Endpoint de la UI (puede fallar con bloqueos anti-bot)
-    "defi_stat": "https://gmgn.ai/defi/quotation/v1/wallet_stat/sol/{wallet}?period={period}",
-}
-
-# Periodos disponibles en GMGN
-PERIODOS = ["7d", "30d"]
-
-# Headers que imitan el navegador + API key si está disponible
-def _build_headers() -> dict:
-    h = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept":          "application/json, text/plain, */*",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Referer":         "https://gmgn.ai/",
-        "Origin":          "https://gmgn.ai",
-    }
-    if GMGN_API_KEY:
-        h["Authorization"] = f"Bearer {GMGN_API_KEY}"
-        h["X-API-Key"]     = GMGN_API_KEY
-    return h
-
-# RPCs públicas de Solana (respaldo on-chain)
+# ── RPCs públicas de Solana ───────────────────────────────────────────────────
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://solana-api.projectserum.com",
@@ -87,7 +51,7 @@ class WalletAnalyzer:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(headers=_build_headers())
+            self.session = aiohttp.ClientSession()
         return self.session
 
     def _rpc(self) -> str:
@@ -110,213 +74,100 @@ class WalletAnalyzer:
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  GMGN — FUENTE PRINCIPAL
-    # ─────────────────────────────────────────────────────────────────────────
-
-    async def _obtener_datos_gmgn(self, wallet: str) -> Optional[dict]:
-        """
-        Intenta obtener datos de GMGN probando todos los endpoints y periodos.
-        Loguea exactamente qué status devuelve cada uno para facilitar debug.
-        """
-        s = await self._get_session()
-
-        for periodo in PERIODOS:
-            for nombre, template in GMGN_ENDPOINTS.items():
-                url = template.format(wallet=wallet, period=periodo)
-                try:
-                    async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                        log.info(f"GMGN [{nombre}] {periodo} → HTTP {r.status}")
-
-                        if r.status == 403:
-                            # Bloqueado — probablemente necesita API key
-                            log.warning(
-                                "GMGN devuelve 403 (bloqueado). "
-                                "Agrega GMGN_API_KEY en tu .env para acceso oficial. "
-                                "Regístrate gratis en https://gmgn.ai/developer"
-                            )
-                            continue
-
-                        if r.status == 429:
-                            log.warning("GMGN rate limit — esperando 3 segundos...")
-                            await asyncio.sleep(3)
-                            continue
-
-                        if r.status != 200:
-                            log.warning(f"GMGN [{nombre}] status inesperado: {r.status}")
-                            continue
-
-                        # Intentar parsear JSON
-                        try:
-                            data = await r.json(content_type=None)
-                        except Exception as e:
-                            log.warning(f"GMGN [{nombre}] respuesta no es JSON válido: {e}")
-                            continue
-
-                        resultado = self._parsear_gmgn(data, wallet)
-                        if resultado:
-                            log.info(
-                                f"✅ GMGN OK — endpoint={nombre} periodo={periodo} "
-                                f"wallet={wallet[:12]}..."
-                            )
-                            return resultado
-                        else:
-                            log.warning(
-                                f"GMGN [{nombre}] respondió 200 pero datos insuficientes "
-                                f"(wallet sin historial suficiente o campos no reconocidos)"
-                            )
-
-                except asyncio.TimeoutError:
-                    log.warning(f"GMGN [{nombre}] timeout")
-                except Exception as e:
-                    log.warning(f"GMGN [{nombre}] error: {e}")
-
-            await asyncio.sleep(0.5)  # pausa entre periodos
-
-        log.warning(
-            f"GMGN no devolvió datos útiles para {wallet[:12]}... "
-            f"API key configurada: {'Sí' if GMGN_API_KEY else 'No'}"
-        )
-        return None
-
-    def _parsear_gmgn(self, data: dict, wallet: str) -> Optional[dict]:
-        """
-        Parsea la respuesta de GMGN, intentando múltiples estructuras posibles
-        porque GMGN cambia los nombres de campo entre versiones.
-        """
-        try:
-            # GMGN puede meter los datos en distintas claves según el endpoint
-            info = (
-                data.get("data")
-                or data.get("wallet")
-                or data.get("result")
-                or data.get("stat")
-                or data
-            )
-
-            if not info or not isinstance(info, dict):
-                return None
-
-            # ── Win rate ──────────────────────────────────────────────────────
-            win_rate = float(
-                info.get("winrate")
-                or info.get("win_rate")
-                or info.get("winRate")
-                or info.get("profit_num", 0)  # algunos endpoints mandan la cuenta
-                or 0
-            )
-            # GMGN a veces devuelve 0.65 (porcentaje decimal) y a veces 65.0
-            if 0 < win_rate <= 1:
-                win_rate = win_rate * 100
-
-            # ── Conteo de trades ──────────────────────────────────────────────
-            total_trades = int(
-                info.get("total_trade_count")
-                or info.get("totalTradeCount")
-                or info.get("trade_count")
-                or info.get("buy_count", 0)
-                or 0
-            )
-            ganados = int(
-                info.get("win_count")
-                or info.get("winCount")
-                or info.get("profit_count")
-                or 0
-            )
-
-            # Recalcular ganados si win_rate está disponible y win_count no
-            if total_trades > 0 and ganados == 0 and win_rate > 0:
-                ganados = int(total_trades * win_rate / 100)
-
-            perdidos = total_trades - ganados
-
-            # ── PnL y promedios ───────────────────────────────────────────────
-            pnl_usd = float(
-                info.get("realized_profit")
-                or info.get("realizedProfit")
-                or info.get("total_profit_usd")
-                or info.get("pnl")
-                or 0
-            )
-            avg_profit = float(
-                info.get("avg_profit_usd")
-                or info.get("avgProfitUsd")
-                or info.get("avg_profit")
-                or 0
-            )
-            avg_loss = float(
-                info.get("avg_loss_usd")
-                or info.get("avgLossUsd")
-                or info.get("avg_loss")
-                or 0
-            )
-            profit_factor = (
-                abs(avg_profit / avg_loss) if avg_loss and avg_loss != 0 else avg_profit
-            )
-
-            # ── Actividad temporal ────────────────────────────────────────────
-            first_trade = (
-                info.get("first_active_timestamp")
-                or info.get("firstActiveTimestamp")
-                or info.get("start_timestamp")
-                or 0
-            )
-            dias_activo    = min(int((time.time() - first_trade) / 86400), 365) if first_trade else 30
-            trades_por_dia = total_trades / max(dias_activo, 1)
-
-            tokens_unicos = int(
-                info.get("token_num")
-                or info.get("tokenNum")
-                or info.get("token_count")
-                or 0
-            )
-
-            # ── Validación mínima ─────────────────────────────────────────────
-            if total_trades < 5:
-                log.info(f"GMGN: wallet con menos de 5 trades ({total_trades}), ignorando")
-                return None
-            if win_rate == 0 and pnl_usd == 0:
-                log.info("GMGN: win_rate y pnl ambos en 0, datos insuficientes")
-                return None
-
-            return {
-                "fuente":          "GMGN",
-                "wallet":          wallet,
-                "win_rate":        round(win_rate, 1),
-                "total_trades":    total_trades,
-                "ganados":         ganados,
-                "perdidos":        perdidos,
-                "pnl_usd":         round(pnl_usd, 2),
-                "avg_profit_usd":  round(avg_profit, 2),
-                "avg_loss_usd":    round(avg_loss, 2),
-                "profit_factor":   round(profit_factor, 2),
-                "dias_activo":     dias_activo,
-                "trades_por_dia":  round(trades_por_dia, 1),
-                "tokens_unicos":   tokens_unicos,
-            }
-
-        except Exception as e:
-            log.error(f"Error parseando respuesta GMGN: {e}")
-            return None
-
-    # ─────────────────────────────────────────────────────────────────────────
     #  ANÁLISIS PRINCIPAL
     # ─────────────────────────────────────────────────────────────────────────
 
     async def analizar(self, wallet: str) -> dict:
-        log.info(f"Analizando wallet: {wallet[:12]}... (API key GMGN: {'✅' if GMGN_API_KEY else '❌ no configurada'})")
+        log.info(f"Analizando wallet: {wallet[:12]}...")
 
-        # Intento 1: GMGN (preciso, rápido, pre-calculado)
-        datos_gmgn = await self._obtener_datos_gmgn(wallet)
-        if datos_gmgn:
-            log.info(f"Usando datos GMGN para {wallet[:12]}")
-            return self._calcular_score_gmgn(wallet, datos_gmgn)
+        # Helius se activa automático cuando pongas la key en .env
+        if HELIUS_API_KEY:
+            log.info("Helius API key detectada — usando Helius ⚡")
+            return await self._analizar_helius(wallet)
 
-        # Intento 2: On-chain RPC (respaldo lento pero sin depender de GMGN)
-        log.info(f"GMGN no disponible → analizando on-chain para {wallet[:12]}")
+        # Sin Helius: análisis directo on-chain (siempre funciona)
+        log.info("Usando análisis on-chain")
         return await self._analizar_onchain(wallet)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  ANÁLISIS ON-CHAIN (respaldo)
+    #  HELIUS (se activa automático cuando pongas la key en .env)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _analizar_helius(self, wallet: str) -> dict:
+        s   = await self._get_session()
+        url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions"
+        params = {
+            "api-key": HELIUS_API_KEY,
+            "limit":   100,
+            "type":    "SWAP",
+        }
+        try:
+            async with s.get(url, params=params,
+                             timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status != 200:
+                    log.warning(f"Helius error {r.status} — cayendo a on-chain")
+                    return await self._analizar_onchain(wallet)
+
+                txs = await r.json()
+                if not txs:
+                    return self._resultado_vacio(wallet, "Sin historial de swaps")
+
+                return self._procesar_helius(wallet, txs)
+
+        except Exception as e:
+            log.error(f"Helius falló: {e} — cayendo a on-chain")
+            return await self._analizar_onchain(wallet)
+
+    def _procesar_helius(self, wallet: str, txs: list) -> dict:
+        trades  = []
+        hace_90 = time.time() - (90 * 24 * 3600)
+
+        for tx in txs:
+            try:
+                ts = tx.get("timestamp", 0)
+                if ts < hace_90:
+                    continue
+
+                eventos = tx.get("events", {})
+                swap    = eventos.get("swap")
+                if not swap:
+                    continue
+
+                native_input  = swap.get("nativeInput",  {})
+                native_output = swap.get("nativeOutput", {})
+                sol_gastado   = (native_input.get("amount",  0) or 0) / 1e9
+                sol_recibido  = (native_output.get("amount", 0) or 0) / 1e9
+                delta_sol     = sol_recibido - sol_gastado
+
+                token_outputs = swap.get("tokenOutputs", [])
+                token_inputs  = swap.get("tokenInputs",  [])
+                token_mint    = None
+                if token_outputs:
+                    token_mint = token_outputs[0].get("mint")
+                elif token_inputs:
+                    token_mint = token_inputs[0].get("mint")
+
+                trades.append({
+                    "timestamp":   ts,
+                    "delta_sol":   round(delta_sol, 6),
+                    "es_ganancia": delta_sol > 0,
+                    "token_mint":  token_mint,
+                    "signature":   tx.get("signature", ""),
+                })
+
+            except Exception as e:
+                log.debug(f"Error procesando TX Helius: {e}")
+                continue
+
+        if not trades:
+            return self._resultado_vacio(wallet, "No se detectaron swaps en los últimos 90 días")
+
+        resultado          = self._calcular_metricas(wallet, trades, len(txs))
+        resultado["fuente"] = "Helius ⚡"
+        return resultado
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  ON-CHAIN (funciona siempre, sin API key)
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _analizar_onchain(self, wallet: str) -> dict:
@@ -344,7 +195,7 @@ class WalletAnalyzer:
         if not todas_sigs:
             return self._resultado_vacio(wallet, "Sin historial de transacciones")
 
-        hace_90       = int(time.time()) - (90 * 24 * 3600)
+        hace_90        = int(time.time()) - (90 * 24 * 3600)
         sigs_recientes = [s for s in todas_sigs if (s.get("blockTime") or 0) >= hace_90]
 
         if len(sigs_recientes) < 5:
@@ -422,61 +273,8 @@ class WalletAnalyzer:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  CÁLCULO DE SCORE
+    #  SCORE Y MÉTRICAS
     # ─────────────────────────────────────────────────────────────────────────
-
-    def _calcular_score_gmgn(self, wallet: str, d: dict) -> dict:
-        score = 0.0
-
-        # Win rate (max 3 pts)
-        if d["win_rate"] >= 65:     score += 3.0
-        elif d["win_rate"] >= 55:   score += 2.0
-        elif d["win_rate"] >= 45:   score += 1.0
-
-        # Profit factor (max 2 pts)
-        if d["profit_factor"] >= 2:      score += 2.0
-        elif d["profit_factor"] >= 1.5:  score += 1.5
-        elif d["profit_factor"] >= 1:    score += 1.0
-
-        # Volumen de trades (max 2 pts)
-        if d["total_trades"] >= 40:   score += 2.0
-        elif d["total_trades"] >= 20: score += 1.5
-        elif d["total_trades"] >= 10: score += 1.0
-
-        # Frecuencia razonable (max 2 pts — penaliza bots)
-        if d["trades_por_dia"] <= 10:   score += 2.0
-        elif d["trades_por_dia"] <= 20: score += 1.0
-
-        # PnL positivo (1 pt)
-        if d["pnl_usd"] > 0:  score += 1.0
-
-        score = min(round(score, 1), 10.0)
-
-        if score >= 7.5:    rec, emoji = "✅ MUY RECOMENDADA — excelente historial", "🟢"
-        elif score >= 5.5:  rec, emoji = "🟡 ACEPTABLE — úsala con precaución",      "🟡"
-        else:               rec, emoji = "🔴 NO RECOMENDADA — historial débil",       "🔴"
-
-        return {
-            "wallet":           wallet,
-            "fuente":           "GMGN ✨",
-            "score":            score,
-            "emoji_score":      emoji,
-            "recomendacion":    rec,
-            "win_rate":         d["win_rate"],
-            "total_trades":     d["total_trades"],
-            "ganados":          d["ganados"],
-            "perdidos":         d["perdidos"],
-            "avg_ganancia_sol": d["avg_profit_usd"],
-            "avg_perdida_sol":  d["avg_loss_usd"],
-            "profit_factor":    d["profit_factor"],
-            "pnl_total_sol":    d["pnl_usd"],
-            "trades_por_dia":   d["trades_por_dia"],
-            "tokens_unicos":    d["tokens_unicos"],
-            "dias_analizados":  d["dias_activo"],
-            "es_bot":           d["trades_por_dia"] > 50,
-            "error":            None,
-            "pnl_en_usd":       True,
-        }
 
     def _calcular_metricas(self, wallet: str, trades: list, total_sigs: int) -> dict:
         total      = len(trades)
@@ -513,13 +311,12 @@ class WalletAnalyzer:
         if not es_bot:
             score += 2.0 if trades_por_dia <= 10 else 1.0
         if pnl > 0:            score += 1.0
-
         score = min(round(score, 1), 10.0)
 
-        if es_bot:            rec, emoji = "⛔ NO RECOMENDADA — posible bot",         "🔴"
-        elif score >= 7.5:    rec, emoji = "✅ MUY RECOMENDADA — excelente historial", "🟢"
-        elif score >= 5.5:    rec, emoji = "🟡 ACEPTABLE — úsala con precaución",      "🟡"
-        else:                 rec, emoji = "🔴 NO RECOMENDADA — historial débil",       "🔴"
+        if es_bot:            rec, emoji = "⛔ NO RECOMENDADA — posible bot",          "🔴"
+        elif score >= 7.5:    rec, emoji = "✅ MUY RECOMENDADA — excelente historial",  "🟢"
+        elif score >= 5.5:    rec, emoji = "🟡 ACEPTABLE — úsala con precaución",       "🟡"
+        else:                 rec, emoji = "🔴 NO RECOMENDADA — historial débil",        "🔴"
 
         return {
             "wallet":           wallet,
