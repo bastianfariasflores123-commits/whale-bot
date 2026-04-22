@@ -128,7 +128,7 @@ class SolanaTrader:
                 try:
                     async with session.get(
                         quote_url, params=params,
-                        timeout=aiohttp.ClientTimeout(total=8)
+                        timeout=aiohttp.ClientTimeout(total=15)
                     ) as r:
                         if r.status == 200:
                             data = await r.json()
@@ -140,6 +140,9 @@ class SolanaTrader:
                             log.warning(f"Jupiter {quote_url[:35]} status {r.status}: {text[:80]}")
                 except Exception as e:
                     log.warning(f"Jupiter {quote_url[:35]} error (intento {intento+1}): {e}")
+
+                if intento < 1:
+                    await asyncio.sleep(1)
 
         log.error("❌ Jupiter no disponible tras todos los intentos")
         return None
@@ -169,7 +172,7 @@ class SolanaTrader:
                     try:
                         async with session.post(
                             swap_url, json=payload,
-                            timeout=aiohttp.ClientTimeout(total=10)
+                            timeout=aiohttp.ClientTimeout(total=25)
                         ) as r:
                             if r.status == 200:
                                 swap_data = await r.json()
@@ -181,6 +184,9 @@ class SolanaTrader:
                                 log.warning(f"Swap {swap_url[:35]} status {r.status}")
                     except Exception as e:
                         log.warning(f"Swap {swap_url[:35]} error (intento {intento+1}): {e}")
+
+                    if intento < 1:
+                        await asyncio.sleep(1)
 
                 if swap_data and "swapTransaction" in swap_data:
                     break
@@ -247,13 +253,19 @@ class SolanaTrader:
         return True
 
     async def copiar_trade(self, token_mint: str, accion: str, monto_usd: float,
-                           stop_loss: float, take_profit: float, max_minutos: float) -> dict:
+                           stop_loss: float, take_profit: float, max_minutos: float,
+                           dex: str = "") -> dict:
         inicio     = time.time()
         precio_sol = await self.obtener_precio_sol()
         sol_amount = monto_usd / precio_sol
         lamports   = int(sol_amount * 1_000_000_000)
 
-        log.info(f"{'🟢' if accion == 'compra' else '🔴'} Copiando {accion} | Token: {token_mint[:8]} | ${monto_usd} | SOL: ${precio_sol:.2f}")
+        # Pump.fun tokens son extremadamente volatiles — necesitan slippage mayor
+        # Error 6014 = slippage exceeded en Pump.fun
+        es_pump_fun = "pump" in dex.lower()
+        slippage_entrada = 5000 if es_pump_fun else 1500  # 50% pump.fun, 15% resto
+
+        log.info(f"{'🟢' if accion == 'compra' else '🔴'} Copiando {accion} | Token: {token_mint[:8]} | ${monto_usd} | Slippage: {slippage_entrada//100}%")
 
         resultado = {
             "token":        token_mint[:8] + "...",
@@ -270,9 +282,8 @@ class SolanaTrader:
             input_mint  = SOL_MINT   if accion == "compra" else token_mint
             output_mint = token_mint if accion == "compra" else SOL_MINT
 
-            # 1500 bps = 15% slippage para tokens Pump.fun (extremadamente volátiles)
             quote_entrada = await self.obtener_cotizacion(
-                input_mint, output_mint, lamports, slippage_bps=1500
+                input_mint, output_mint, lamports, slippage_bps=slippage_entrada
             )
             if not quote_entrada:
                 resultado["estado"] = "sin_cotizacion"
@@ -312,7 +323,7 @@ class SolanaTrader:
                     precio_sol = await self.obtener_precio_sol()
 
                 quote_actual = await self.obtener_cotizacion(
-                    token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=1500
+                    token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=slippage_entrada
                 )
                 if quote_actual:
                     valor_sol = int(quote_actual.get("outAmount", 0)) / 1_000_000_000
@@ -341,7 +352,7 @@ class SolanaTrader:
             if accion == "compra" and tokens_obtenidos > 0:
                 for intento_cierre in range(3):
                     quote_salida = await self.obtener_cotizacion(
-                        token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=1500
+                        token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=slippage_entrada
                     )
                     if quote_salida:
                         tx_salida = await self.ejecutar_swap(quote_salida)

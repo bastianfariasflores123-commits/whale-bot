@@ -776,12 +776,6 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
                     log.info(f"🎯 Nueva TX: {sig[:20]} | {tx.get('accion','?')} | {tx.get('dex','?')}")
 
-                    # Solo copiar compras — las ventas son de tokens que no tenemos
-                    if tx.get('accion') != 'compra':
-                        log.info(f"⏭️ Ignorando {tx.get('accion','?')} — solo se copian compras")
-                        db.marcar_tx(sig)
-                        continue
-
                     # Marcar primero para evitar doble ejecución
                     db.marcar_tx(sig)
 
@@ -793,6 +787,7 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
                         stop_loss   = cfg["stop_loss_pct"],
                         take_profit = cfg["take_profit_pct"],
                         max_minutos = cfg["max_minutos"],
+                        dex         = tx.get("dex", ""),
                     )
 
                     # Protección: no procesar si resultado es inválido
