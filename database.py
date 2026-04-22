@@ -1,7 +1,8 @@
 """
 database.py — Almacenamiento local con SQLite (sin servidor, sin costo)
 Guarda: wallets seguidas, trades ejecutados, configuración del bot
-Las wallets también se respaldan en variable de entorno para sobrevivir deploys
+Las wallets Y las TXs procesadas se respaldan en variables de entorno
+para sobrevivir los reinicios de Railway (la DB en /tmp se borra)
 """
 
 import sqlite3
@@ -13,8 +14,6 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Usar /tmp en Railway para que persista entre reinicios del mismo deploy
-# Si existe la variable DB_PATH en entorno, usarla (para Railway Volumes)
 DB_PATH = os.getenv("DB_PATH", "/tmp/whale_bot.db")
 
 
@@ -23,6 +22,7 @@ class Database:
         self.path = path
         self._inicializar()
         self._restaurar_wallets_desde_env()
+        self._restaurar_txs_desde_env()
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -30,7 +30,6 @@ class Database:
         return conn
 
     def _inicializar(self):
-        """Crea las tablas si no existen."""
         with self._conn() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS wallets (
@@ -64,7 +63,6 @@ class Database:
                 );
             """)
 
-            # Configuración por defecto
             defaults = {
                 "monto_usd":       "5",
                 "stop_loss_pct":   "8",
@@ -78,22 +76,14 @@ class Database:
                 )
         log.info(f"Base de datos inicializada en {self.path}")
 
-    # ── RESPALDO DE WALLETS EN VARIABLE DE ENTORNO ────────────────────────────
+    # ── RESPALDO DE WALLETS ───────────────────────────────────────────────────
 
     def _restaurar_wallets_desde_env(self):
-        """
-        Al iniciar, si la DB está vacía pero hay wallets guardadas en
-        la variable WALLETS_BACKUP, las restaura automáticamente.
-        Esto evita perder las wallets en cada deploy de Railway.
-        """
-        wallets_actuales = self.obtener_wallets()
-        if wallets_actuales:
-            return  # Ya hay wallets, no restaurar
-
+        if self.obtener_wallets():
+            return
         backup = os.getenv("WALLETS_BACKUP", "")
         if not backup:
             return
-
         try:
             wallets = json.loads(backup)
             for address in wallets:
@@ -103,25 +93,48 @@ class Database:
             log.warning(f"No se pudo restaurar wallets desde env: {e}")
 
     def _guardar_wallets_en_env(self):
-        """
-        Guarda las wallets actuales como JSON en WALLETS_BACKUP.
-        Se llama automáticamente cuando se agrega o quita una wallet.
-        NOTA: Esto actualiza la variable en memoria. Para persistir entre
-        deploys, hay que actualizar la variable en Railway manualmente
-        o usar el comando /backup en el bot.
-        """
         try:
             wallets = [w["address"] for w in self.obtener_wallets()]
-            backup  = json.dumps(wallets)
-            os.environ["WALLETS_BACKUP"] = backup
+            os.environ["WALLETS_BACKUP"] = json.dumps(wallets)
             log.info(f"Wallets respaldadas en memoria: {len(wallets)}")
-            return backup
         except Exception as e:
             log.warning(f"Error respaldando wallets: {e}")
-            return ""
-        log.info("Base de datos inicializada")
 
-    # ── WALLETS ──────────────────────────────────────────────────────────────
+    # ── RESPALDO DE TXS PROCESADAS ────────────────────────────────────────────
+
+    def _restaurar_txs_desde_env(self):
+        """
+        Restaura las últimas TXs procesadas desde TXS_BACKUP.
+        Esto evita reprocesar la misma TX tras un reinicio de Railway.
+        Solo guardamos las últimas 200 para no crecer indefinidamente.
+        """
+        backup = os.getenv("TXS_BACKUP", "")
+        if not backup:
+            return
+        try:
+            sigs = json.loads(backup)
+            with self._conn() as conn:
+                for sig in sigs:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO txs_procesadas (signature) VALUES (?)", (sig,)
+                    )
+            log.info(f"✅ {len(sigs)} TXs procesadas restauradas desde TXS_BACKUP")
+        except Exception as e:
+            log.warning(f"No se pudo restaurar TXs desde env: {e}")
+
+    def _guardar_txs_en_env(self):
+        """Guarda las últimas 200 TXs procesadas en memoria."""
+        try:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT signature FROM txs_procesadas ORDER BY fecha DESC LIMIT 200"
+                ).fetchall()
+            sigs = [r["signature"] for r in rows]
+            os.environ["TXS_BACKUP"] = json.dumps(sigs)
+        except Exception as e:
+            log.warning(f"Error respaldando TXs: {e}")
+
+    # ── WALLETS ───────────────────────────────────────────────────────────────
 
     def agregar_wallet(self, address: str):
         with self._conn() as conn:
@@ -149,7 +162,7 @@ class Database:
             rows = conn.execute(query).fetchall()
             return [dict(r) for r in rows]
 
-    # ── TRANSACCIONES PROCESADAS ─────────────────────────────────────────────
+    # ── TRANSACCIONES PROCESADAS ──────────────────────────────────────────────
 
     def tx_procesada(self, signature: str) -> bool:
         with self._conn() as conn:
@@ -163,8 +176,10 @@ class Database:
             conn.execute(
                 "INSERT OR IGNORE INTO txs_procesadas (signature) VALUES (?)", (signature,)
             )
+        # Guardar en env para que sobreviva reinicios
+        self._guardar_txs_en_env()
 
-    # ── TRADES ───────────────────────────────────────────────────────────────
+    # ── TRADES ────────────────────────────────────────────────────────────────
 
     def registrar_trade(self, resultado: dict):
         with self._conn() as conn:
@@ -173,24 +188,24 @@ class Database:
                 VALUES (:token, :token_mint, :accion, :invertido, :pnl_usd, :duracion_min, :estado, :tx_hash)
             """, resultado)
 
+    def _stats_vacio(self) -> dict:
+        return {
+            "total_trades": 0, "ganados": 0, "perdidos": 0,
+            "win_rate": 0.0, "pnl_total": 0.0,
+            "mejor_trade": 0.0, "peor_trade": 0.0,
+            "promedio_trade": 0.0, "trades": [],
+        }
+
     def obtener_estadisticas(self) -> dict:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT pnl_usd FROM trades WHERE estado = 'cerrado'"
             ).fetchall()
-
             pnls = [r["pnl_usd"] for r in rows]
-
             if not pnls:
-                return {
-                    "total_trades": 0, "ganados": 0, "perdidos": 0,
-                    "win_rate": 0.0, "pnl_total": 0.0,
-                    "mejor_trade": 0.0, "peor_trade": 0.0,
-                }
-
+                return self._stats_vacio()
             ganados  = sum(1 for p in pnls if p > 0)
             perdidos = sum(1 for p in pnls if p <= 0)
-
             return {
                 "total_trades": len(pnls),
                 "ganados":      ganados,
@@ -202,7 +217,6 @@ class Database:
             }
 
     def obtener_estadisticas_periodo(self, dias: int) -> dict:
-        """Obtiene estadísticas de los últimos N días."""
         with self._conn() as conn:
             rows = conn.execute("""
                 SELECT pnl_usd, fecha, token, accion, invertido
@@ -220,36 +234,31 @@ class Database:
             perdidos = sum(1 for p in pnls if p <= 0)
 
             return {
-                "total_trades":  len(pnls),
-                "ganados":       ganados,
-                "perdidos":      perdidos,
-                "win_rate":      round((ganados / len(pnls)) * 100, 1) if pnls else 0,
-                "pnl_total":     round(sum(pnls), 2),
-                "mejor_trade":   round(max(pnls), 2),
-                "peor_trade":    round(min(pnls), 2),
+                "total_trades":   len(pnls),
+                "ganados":        ganados,
+                "perdidos":       perdidos,
+                "win_rate":       round((ganados / len(pnls)) * 100, 1),
+                "pnl_total":      round(sum(pnls), 2),
+                "mejor_trade":    round(max(pnls), 2),
+                "peor_trade":     round(min(pnls), 2),
                 "promedio_trade": round(sum(pnls) / len(pnls), 2),
-                "trades":        [dict(r) for r in rows],
+                "trades":         [dict(r) for r in rows],
             }
 
     def obtener_resumen_semanal(self) -> dict:
-        """Resumen detallado de la semana actual y comparación con la anterior."""
         semana_actual   = self.obtener_estadisticas_periodo(7)
         semana_anterior = self.obtener_estadisticas_periodo(14)
+        pnl_anterior    = semana_anterior["pnl_total"] - semana_actual["pnl_total"]
 
-        # PnL de la semana anterior solamente
-        pnl_anterior = semana_anterior["pnl_total"] - semana_actual["pnl_total"]
-
-        # Variación porcentual
         if pnl_anterior != 0:
             variacion = ((semana_actual["pnl_total"] - pnl_anterior) / abs(pnl_anterior)) * 100
         else:
             variacion = 100.0 if semana_actual["pnl_total"] > 0 else 0.0
 
-        # Mejor día de la semana
-        trades_semana = semana_actual.get("trades", [])
+        trades_semana    = semana_actual.get("trades", [])
         ganancias_por_dia = {}
         for t in trades_semana:
-            fecha = t["fecha"][:10]  # solo YYYY-MM-DD
+            fecha = t["fecha"][:10]
             ganancias_por_dia[fecha] = ganancias_por_dia.get(fecha, 0) + t["pnl_usd"]
 
         mejor_dia = max(ganancias_por_dia.items(), key=lambda x: x[1]) if ganancias_por_dia else (None, 0)
@@ -266,68 +275,32 @@ class Database:
         }
 
     def obtener_resumen_mensual(self) -> dict:
-        """Resumen del mes actual con proyección al cierre."""
         mes_actual = self.obtener_estadisticas_periodo(30)
-
-        # Días transcurridos del mes (aproximado)
         with self._conn() as conn:
             primer_trade = conn.execute(
                 "SELECT MIN(fecha) as primera FROM trades WHERE estado = 'cerrado'"
             ).fetchone()
 
         if primer_trade and primer_trade["primera"]:
-            from datetime import datetime
             primera_fecha = datetime.fromisoformat(primer_trade["primera"])
             dias_activo   = max((datetime.now() - primera_fecha).days, 1)
             dias_activo   = min(dias_activo, 30)
         else:
             dias_activo = 1
 
-        promedio_diario   = mes_actual["pnl_total"] / dias_activo if dias_activo else 0
-        proyeccion_mes    = promedio_diario * 30
-        dias_para_meta    = 100 / promedio_diario if promedio_diario > 0 else 0
+        promedio_diario = mes_actual["pnl_total"] / dias_activo if dias_activo else 0
+        proyeccion_mes  = promedio_diario * 30
+        dias_para_meta  = 100 / promedio_diario if promedio_diario > 0 else 0
 
         return {
             **mes_actual,
-            "dias_activo":      dias_activo,
-            "promedio_diario":  round(promedio_diario, 2),
-            "proyeccion_mes":   round(proyeccion_mes, 2),
-            "dias_para_meta":   round(dias_para_meta, 1),
+            "dias_activo":     dias_activo,
+            "promedio_diario": round(promedio_diario, 2),
+            "proyeccion_mes":  round(proyeccion_mes, 2),
+            "dias_para_meta":  round(dias_para_meta, 1),
         }
 
-    def obtener_estadisticas(self) -> dict:
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT pnl_usd FROM trades WHERE estado = 'cerrado'"
-            ).fetchall()
-
-            pnls = [r["pnl_usd"] for r in rows]
-
-            if not pnls:
-                return self._stats_vacio()
-
-            ganados  = sum(1 for p in pnls if p > 0)
-            perdidos = sum(1 for p in pnls if p <= 0)
-
-            return {
-                "total_trades": len(pnls),
-                "ganados":      ganados,
-                "perdidos":     perdidos,
-                "win_rate":     (ganados / len(pnls)) * 100,
-                "pnl_total":    round(sum(pnls), 4),
-                "mejor_trade":  round(max(pnls), 4),
-                "peor_trade":   round(min(pnls), 4),
-            }
-
-    def _stats_vacio(self) -> dict:
-        return {
-            "total_trades": 0, "ganados": 0, "perdidos": 0,
-            "win_rate": 0.0, "pnl_total": 0.0,
-            "mejor_trade": 0.0, "peor_trade": 0.0,
-            "promedio_trade": 0.0, "trades": [],
-        }
-
-    # ── CONFIGURACIÓN ────────────────────────────────────────────────────────
+    # ── CONFIGURACIÓN ─────────────────────────────────────────────────────────
 
     def obtener_config(self) -> dict:
         with self._conn() as conn:
