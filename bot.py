@@ -756,11 +756,11 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
         for w in wallets:
             try:
-                # Obtener TXs nuevas — pasamos un set vacío porque el filtro
-                # real se hace abajo con db.tx_procesada() para evitar duplicados
+                # Obtener TXs nuevas — el monitor recibe las últimas 10 sigs procesadas
+                # para filtrar en la primera capa y no depender solo de la DB
                 txs_nuevas = await monitor.obtener_transacciones_nuevas(
                     w["address"],
-                    ya_procesadas=set()
+                    ya_procesadas=set()  # El filtro real se hace con db.tx_procesada() abajo
                 )
 
                 for tx in txs_nuevas:

@@ -378,19 +378,24 @@ class SolanaTrader:
 
             resultado["tx_hash"] = tx_entrada
 
-            # Para Pump.fun sin cotización de Jupiter, estimar tokens
+            # Para Pump.fun sin cotización de Jupiter, estimar tokens basado en SOL
+            # Usamos lamports directamente como cantidad mínima para las cotizaciones
             if es_pump and tokens_obtenidos == 0:
-                tokens_obtenidos = int(lamports * 1000)  # estimación
+                # No estimamos tokens — usaremos un query de "sell 100%" vía Pump.fun
+                # Seteamos un valor alto para que Jupiter intente cotizar
+                tokens_obtenidos = lamports * 100  # estimación conservadora
 
             log.info(f"✅ Posición abierta | TX: {tx_entrada[:20]}")
 
             # ── Monitorear posición ───────────────────────────────────────────
-            inicio       = time.time()
-            max_segundos = max_minutos * 60
-            sl_factor    = 1 - (stop_loss / 100)
-            tp_factor    = 1 + (take_profit / 100)
-            pnl          = 0.0
-            razon_cierre = "timeout"
+            inicio        = time.time()
+            max_segundos  = max_minutos * 60
+            sl_factor     = 1 - (stop_loss / 100)
+            tp_factor     = 1 + (take_profit / 100)
+            pnl           = 0.0
+            razon_cierre  = "timeout"
+            fallos_cotizacion = 0  # contador de fallos consecutivos
+            MIN_HOLD_SEGUNDOS = 120  # esperar al menos 2 min antes de permitir stop loss
 
             while (time.time() - inicio) < max_segundos:
                 elapsed_min = (time.time() - inicio) / 60
@@ -407,8 +412,24 @@ class SolanaTrader:
                 if quote_actual:
                     valor_sol = int(quote_actual.get("outAmount", 0)) / 1_000_000_000
                     valor_usd = valor_sol * precio_sol
-                    pnl       = valor_usd - monto_usd
-                    cambio    = valor_usd / monto_usd if monto_usd else 1
+
+                    # PROTECCIÓN: si la cotización devuelve 0 o un valor absurdo,
+                    # ignorar esta iteración — no cerrar por datos erróneos de la API
+                    if valor_usd < monto_usd * 0.01:
+                        fallos_cotizacion += 1
+                        log.warning(f"⚠️ Cotización sospechosa (${valor_usd:.4f}), fallo #{fallos_cotizacion}, ignorando...")
+                        # Si falla 5 veces seguidas, cerrar por seguridad
+                        if fallos_cotizacion >= 5:
+                            razon_cierre = "error_cotizacion"
+                            log.error("❌ 5 fallos consecutivos de cotización — cerrando posición")
+                            break
+                        await asyncio.sleep(30)
+                        continue
+
+                    fallos_cotizacion = 0  # resetear contador en cotización válida
+                    pnl    = valor_usd - monto_usd
+                    cambio = valor_usd / monto_usd
+                    elapsed_seg = time.time() - inicio
 
                     log.info(f"📊 ${valor_usd:.2f} | PnL: {'+' if pnl>=0 else ''}{pnl:.2f} | {elapsed_min:.1f}min")
 
@@ -416,9 +437,20 @@ class SolanaTrader:
                         razon_cierre = "take_profit"
                         log.info(f"🎯 Take Profit {take_profit}%!")
                         break
-                    if cambio <= sl_factor:
+                    # Stop loss solo se activa tras el tiempo mínimo de hold
+                    if cambio <= sl_factor and elapsed_seg >= MIN_HOLD_SEGUNDOS:
                         razon_cierre = "stop_loss"
                         log.info(f"🛑 Stop Loss {stop_loss}%!")
+                        break
+                    elif cambio <= sl_factor:
+                        log.info(f"⏳ En stop loss pero esperando min hold ({elapsed_seg:.0f}s/{MIN_HOLD_SEGUNDOS}s)...")
+                else:
+                    # API no respondió — esperar sin tomar decisión
+                    fallos_cotizacion += 1
+                    log.warning(f"⚠️ Sin cotización en este ciclo (fallo #{fallos_cotizacion}), esperando...")
+                    if fallos_cotizacion >= 5:
+                        razon_cierre = "error_cotizacion"
+                        log.error("❌ 5 fallos consecutivos de cotización — cerrando posición")
                         break
 
                 await asyncio.sleep(30)

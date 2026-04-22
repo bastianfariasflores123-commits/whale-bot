@@ -64,10 +64,10 @@ class Database:
             """)
 
             defaults = {
-                "monto_usd":       "5",
-                "stop_loss_pct":   "8",
-                "take_profit_pct": "25",
-                "max_minutos":     "45",
+                "monto_usd":       "3",
+                "stop_loss_pct":   "15",   # antes 8% — muy agresivo para memecoins
+                "take_profit_pct": "30",
+                "max_minutos":     "60",
             }
             for clave, valor in defaults.items():
                 conn.execute(
