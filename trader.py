@@ -12,8 +12,6 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Jupiter — public.jupiterapi.com primero, único que funciona en Railway
-# lite.jup.ag y quote-api.jup.ag están bloqueados en Railway (DNS no resuelve)
 JUPITER_QUOTE_URLS = [
     "https://public.jupiterapi.com/quote",
     "https://quote-api.jup.ag/v6/quote",
@@ -25,7 +23,6 @@ JUPITER_SWAP_URLS = [
     "https://lite.jup.ag/v6/swap",
 ]
 
-# RPCs — solana.publicnode.com crashea con PanicException, excluido
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://endpoints.omniatech.io/v1/sol/mainnet/public",
@@ -120,7 +117,7 @@ class SolanaTrader:
             "amount":              str(monto_lamports),
             "slippageBps":         str(slippage_bps),
             "onlyDirectRoutes":    "false",
-            "asLegacyTransaction": "false",  # necesario para tokens Token-2022 de Pump.fun
+            "asLegacyTransaction": "false",
         }
 
         for quote_url in JUPITER_QUOTE_URLS:
@@ -128,7 +125,7 @@ class SolanaTrader:
                 try:
                     async with session.get(
                         quote_url, params=params,
-                        timeout=aiohttp.ClientTimeout(total=15)
+                        timeout=aiohttp.ClientTimeout(total=8)
                     ) as r:
                         if r.status == 200:
                             data = await r.json()
@@ -140,9 +137,6 @@ class SolanaTrader:
                             log.warning(f"Jupiter {quote_url[:35]} status {r.status}: {text[:80]}")
                 except Exception as e:
                     log.warning(f"Jupiter {quote_url[:35]} error (intento {intento+1}): {e}")
-
-                if intento < 1:
-                    await asyncio.sleep(1)
 
         log.error("❌ Jupiter no disponible tras todos los intentos")
         return None
@@ -172,7 +166,7 @@ class SolanaTrader:
                     try:
                         async with session.post(
                             swap_url, json=payload,
-                            timeout=aiohttp.ClientTimeout(total=25)
+                            timeout=aiohttp.ClientTimeout(total=10)
                         ) as r:
                             if r.status == 200:
                                 swap_data = await r.json()
@@ -185,9 +179,6 @@ class SolanaTrader:
                     except Exception as e:
                         log.warning(f"Swap {swap_url[:35]} error (intento {intento+1}): {e}")
 
-                    if intento < 1:
-                        await asyncio.sleep(1)
-
                 if swap_data and "swapTransaction" in swap_data:
                     break
 
@@ -199,7 +190,6 @@ class SolanaTrader:
             tx        = VersionedTransaction.from_bytes(tx_bytes)
             signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
-            # skip_preflight=True para evitar crash PanicException con algunos RPCs
             for rpc_url in SOLANA_RPC_URLS:
                 try:
                     from solana.rpc.async_api import AsyncClient
@@ -223,47 +213,55 @@ class SolanaTrader:
             log.error(f"Error ejecutando swap: {e}")
             return None
 
-    async def verificar_tx(self, tx_hash: str) -> bool:
-        """Verifica si una TX realmente se confirmó en la blockchain sin error."""
+    async def verificar_tx(self, tx_hash: str, max_intentos: int = 6, espera: float = 5.0) -> bool:
+        """
+        Verifica si una TX realmente se confirmó en la blockchain sin error.
+        Reintenta hasta max_intentos veces. NUNCA asume éxito si no puede confirmar.
+        """
         session = await self._get_session()
         payload = {
             "jsonrpc": "2.0", "id": 1,
             "method":  "getTransaction",
             "params":  [tx_hash, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
         }
-        for rpc_url in SOLANA_RPC_URLS:
-            try:
-                async with session.post(rpc_url, json=payload,
-                                        timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status == 200:
-                        data   = await r.json()
-                        result = data.get("result")
-                        if result:
-                            err = result.get("meta", {}).get("err")
-                            if err is None:
-                                log.info(f"✅ TX {tx_hash[:16]} confirmada on-chain")
-                                return True
-                            else:
-                                log.warning(f"❌ TX {tx_hash[:16]} falló on-chain: {err}")
-                                return False
-            except Exception as e:
-                log.warning(f"Error verificando TX via {rpc_url[:35]}: {e}")
-        # No se pudo verificar aún (puede estar pendiente), asumir ok tras timeout
-        log.warning(f"⚠️ No se pudo verificar TX {tx_hash[:16]} — asumiendo ok")
-        return True
+        for intento in range(max_intentos):
+            for rpc_url in SOLANA_RPC_URLS:
+                try:
+                    async with session.post(rpc_url, json=payload,
+                                            timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        if r.status == 200:
+                            data   = await r.json()
+                            result = data.get("result")
+                            if result:
+                                err = result.get("meta", {}).get("err")
+                                if err is None:
+                                    log.info(f"✅ TX {tx_hash[:16]} confirmada on-chain (intento {intento+1})")
+                                    return True
+                                else:
+                                    log.error(f"❌ TX {tx_hash[:16]} falló on-chain: {err}")
+                                    return False
+                            # result=None → TX aún pendiente, reintentar
+                except Exception as e:
+                    log.warning(f"Error verificando TX via {rpc_url[:35]}: {e}")
+
+            if intento < max_intentos - 1:
+                log.info(f"⏳ TX {tx_hash[:16]} pendiente, reintentando en {espera}s ({intento+1}/{max_intentos})...")
+                await asyncio.sleep(espera)
+
+        log.error(f"❌ No se pudo confirmar TX {tx_hash[:16]} tras {max_intentos} intentos — abortando")
+        return False
 
     async def copiar_trade(self, token_mint: str, accion: str, monto_usd: float,
                            stop_loss: float, take_profit: float, max_minutos: float,
                            dex: str = "") -> dict:
-        inicio     = time.time()
+
         precio_sol = await self.obtener_precio_sol()
         sol_amount = monto_usd / precio_sol
         lamports   = int(sol_amount * 1_000_000_000)
 
-        # Pump.fun tokens son extremadamente volatiles — necesitan slippage mayor
-        # Error 6014 = slippage exceeded en Pump.fun
-        es_pump_fun = "pump" in dex.lower()
-        slippage_entrada = 5000 if es_pump_fun else 1500  # 50% pump.fun, 15% resto
+        # Pump.fun necesita slippage mayor — error 6014 = slippage exceeded
+        es_pump_fun      = "pump" in dex.lower()
+        slippage_entrada = 5000 if es_pump_fun else 1500   # 50% pump.fun, 15% resto
 
         log.info(f"{'🟢' if accion == 'compra' else '🔴'} Copiando {accion} | Token: {token_mint[:8]} | ${monto_usd} | Slippage: {slippage_entrada//100}%")
 
@@ -295,9 +293,9 @@ class SolanaTrader:
                 resultado["estado"] = "swap_fallido"
                 return resultado
 
-            # Esperar confirmación y verificar que no falló on-chain
+            # Esperar y verificar — NUNCA asume éxito
             log.info(f"⏳ Esperando confirmación de TX {tx_entrada[:16]}...")
-            await asyncio.sleep(8)
+            await asyncio.sleep(12)
             tx_ok = await self.verificar_tx(tx_entrada)
 
             if not tx_ok:
@@ -308,18 +306,32 @@ class SolanaTrader:
 
             resultado["tx_hash"] = tx_entrada
             tokens_obtenidos     = int(quote_entrada.get("outAmount", 0))
-            log.info(f"✅ Posición abierta y confirmada | TX: {tx_entrada[:20]} | Tokens: {tokens_obtenidos}")
 
-            # Monitorear posición
-            max_segundos = max_minutos * 60
-            sl_factor    = 1 - (stop_loss / 100)
-            tp_factor    = 1 + (take_profit / 100)
-            pnl          = 0.0
+            if tokens_obtenidos <= 0:
+                log.error(f"❌ outAmount=0 para {token_mint[:8]} — abortando")
+                resultado["estado"] = "sin_tokens_recibidos"
+                return resultado
+
+            log.info(f"✅ Posición abierta | TX: {tx_entrada[:20]} | Tokens: {tokens_obtenidos}")
+
+            # ── Timer empieza AQUÍ, cuando la posición está realmente abierta ──
+            inicio        = time.time()
+            max_segundos  = max_minutos * 60
+            sl_factor     = 1 - (stop_loss / 100)
+            tp_factor     = 1 + (take_profit / 100)
+            pnl           = 0.0
+            razon_cierre  = "timeout"
 
             while True:
-                elapsed = (time.time() - inicio) / 60
+                # Chequear timeout AL INICIO del loop
+                elapsed_seg = time.time() - inicio
+                if elapsed_seg >= max_segundos:
+                    log.info(f"⏱️ Timeout {max_minutos}min alcanzado")
+                    razon_cierre = "timeout"
+                    break
 
-                if int(elapsed) % 5 == 0 and elapsed > 0:
+                elapsed_min = elapsed_seg / 60
+                if elapsed_min > 0 and int(elapsed_min) % 5 == 0:
                     precio_sol = await self.obtener_precio_sol()
 
                 quote_actual = await self.obtener_cotizacion(
@@ -331,24 +343,23 @@ class SolanaTrader:
                     pnl       = valor_usd - monto_usd
                     cambio    = valor_usd / monto_usd if monto_usd else 1
 
-                    log.info(f"📊 Posición: ${valor_usd:.2f} | PnL: {'+' if pnl>=0 else ''}{pnl:.2f} | {elapsed:.1f}min")
+                    log.info(f"📊 Posición: ${valor_usd:.2f} | PnL: {'+' if pnl>=0 else ''}{pnl:.2f} | {elapsed_min:.1f}min")
 
                     if cambio >= tp_factor:
                         log.info(f"🎯 Take Profit {take_profit}% alcanzado")
+                        razon_cierre = "take_profit"
                         break
                     if cambio <= sl_factor:
                         log.info(f"🛑 Stop Loss {stop_loss}% activado")
+                        razon_cierre = "stop_loss"
                         break
                 else:
                     log.warning("⚠️ Sin cotización al monitorear — reintentando en 30s")
 
-                if (time.time() - inicio) >= max_segundos:
-                    log.info(f"⏱️ Timeout {max_minutos}min alcanzado")
-                    break
-
                 await asyncio.sleep(30)
 
-            # Cerrar posición con reintentos
+            # ── Cerrar posición con reintentos ──
+            pnl_real = pnl
             if accion == "compra" and tokens_obtenidos > 0:
                 for intento_cierre in range(3):
                     quote_salida = await self.obtener_cotizacion(
@@ -357,13 +368,14 @@ class SolanaTrader:
                     if quote_salida:
                         tx_salida = await self.ejecutar_swap(quote_salida)
                         if tx_salida:
-                            await asyncio.sleep(8)
+                            await asyncio.sleep(12)
                             cierre_ok = await self.verificar_tx(tx_salida)
                             if cierre_ok:
                                 sol_final   = int(quote_salida.get("outAmount", 0)) / 1_000_000_000
+                                precio_sol  = await self.obtener_precio_sol()
                                 valor_final = sol_final * precio_sol
-                                pnl         = valor_final - monto_usd
-                                log.info(f"{'✅' if pnl>=0 else '❌'} Posición cerrada | PnL: {'+' if pnl>=0 else ''}${pnl:.2f}")
+                                pnl_real    = valor_final - monto_usd
+                                log.info(f"{'✅' if pnl_real>=0 else '❌'} Posición cerrada ({razon_cierre}) | PnL real: {'+' if pnl_real>=0 else ''}${pnl_real:.2f}")
                                 break
                             else:
                                 log.warning(f"TX cierre falló on-chain, reintentando {intento_cierre+1}/3...")
@@ -371,9 +383,10 @@ class SolanaTrader:
 
             duracion = round((time.time() - inicio) / 60, 1)
             resultado.update({
-                "pnl_usd":      round(pnl, 4),
+                "pnl_usd":      round(pnl_real, 4),
                 "duracion_min": duracion,
                 "estado":       "cerrado",
+                "razon_cierre": razon_cierre,
             })
 
         except Exception as e:
