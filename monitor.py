@@ -44,6 +44,10 @@ class WalletMonitor:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.rpc_index = 0
+        # Guarda la signature MÁS RECIENTE vista por cada wallet.
+        # Al primer ciclo de cada wallet, se marca el estado actual sin procesar nada.
+        # Así el bot solo reacciona a TXs que ocurren DESPUÉS de arrancar.
+        self._ultima_sig: dict = {}   # wallet_address -> signature más reciente
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -79,18 +83,40 @@ class WalletMonitor:
         if not sigs:
             return []
 
-        nuevas = [
-            s for s in sigs
-            if s.get("signature") not in ya_procesadas
-            and not s.get("err")
-        ]
+        # ── PRIMERA VEZ que vemos esta wallet en esta sesión ─────────────────
+        # Guardamos la TX más reciente como "punto de partida" y no procesamos nada.
+        # Esto evita copiar operaciones que la ballena hizo hace horas/días.
+        if wallet_address not in self._ultima_sig:
+            sig_reciente = sigs[0].get("signature") if sigs else None
+            self._ultima_sig[wallet_address] = sig_reciente
+            log.info(f"🔖 Wallet {wallet_address[:8]} inicializada — "
+                     f"última TX: {sig_reciente[:16] if sig_reciente else 'ninguna'}... "
+                     f"(operaciones anteriores ignoradas)")
+            return []  # No procesar historial
+
+        # ── CICLOS SIGUIENTES — solo TXs más nuevas que la última vista ──────
+        ultima_conocida = self._ultima_sig[wallet_address]
+        nuevas = []
+        for s in sigs:
+            sig = s.get("signature")
+            if sig == ultima_conocida:
+                break  # llegamos al punto donde quedamos, parar
+            if not s.get("err"):
+                nuevas.append(s)
 
         if not nuevas:
             return []
 
+        # Actualizar la última sig vista (la más reciente de este ciclo)
+        self._ultima_sig[wallet_address] = sigs[0].get("signature")
+
         resultado = []
         for sig_info in nuevas:
-            tx = await self._analizar_signature(sig_info["signature"])
+            sig = sig_info["signature"]
+            # Doble filtro con la DB por si acaso
+            if sig in ya_procesadas:
+                continue
+            tx = await self._analizar_signature(sig)
             if tx:
                 resultado.append(tx)
             await asyncio.sleep(0.2)

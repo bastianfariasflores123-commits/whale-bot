@@ -731,8 +731,9 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
     """
-    Corre cada 15 segundos. Revisa las últimas 10 TXs de cada wallet
-    para no perder ningún trade aunque la ballena opere rápido.
+    Corre cada 15 segundos. Revisa TXs NUEVAS (posteriores al arranque) de cada wallet.
+    Los trades se lanzan como tareas en background para no bloquear el loop.
+    El botón ⏹️ Detener responde inmediatamente.
     """
     log.info("🔄 Loop de monitoreo iniciado")
 
@@ -740,27 +741,31 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
     if trader.esta_listo():
         await ctx.bot.send_message(
             chat_id    = AUTHORIZED_USER,
-            text       = f"✅ *Bot iniciado correctamente*\n\n💼 Wallet: `{trader.pubkey_str[:12]}...`\n🐋 Monitoreando {len(db.obtener_wallets(solo_activas=True))} wallets",
+            text       = f"✅ *Bot iniciado correctamente*\n\n💼 Wallet: `{trader.pubkey_str[:12]}...`\n🐋 Monitoreando {len(db.obtener_wallets(solo_activas=True))} wallets\n\n_Solo se copiarán operaciones que ocurran a partir de ahora._",
             parse_mode = "Markdown"
         )
     else:
         await ctx.bot.send_message(
             chat_id    = AUTHORIZED_USER,
-            text       = "⚠️ *Bot iniciado en modo simulación*\n\nNo se pudo cargar la wallet. Verifica SOLANA_PRIVATE_KEY en Railway.",
+            text       = "⚠️ *Bot iniciado en modo simulación*\n\nNo se pudo cargar la wallet. Verifica SOLANA_PRIVATE_KEY.",
             parse_mode = "Markdown"
         )
+
+    # Set de trades activos para no lanzar dos trades del mismo token a la vez
+    tokens_en_trade: set = set()
 
     while ctx.bot_data.get("corriendo"):
         wallets = db.obtener_wallets(solo_activas=True)
         cfg     = db.obtener_config()
 
         for w in wallets:
+            # Verificar flag ANTES de cada wallet — detener responde más rápido
+            if not ctx.bot_data.get("corriendo"):
+                break
             try:
-                # Obtener TXs nuevas — el monitor recibe las últimas 10 sigs procesadas
-                # para filtrar en la primera capa y no depender solo de la DB
                 txs_nuevas = await monitor.obtener_transacciones_nuevas(
                     w["address"],
-                    ya_procesadas=set()  # El filtro real se hace con db.tx_procesada() abajo
+                    ya_procesadas=set()
                 )
 
                 for tx in txs_nuevas:
@@ -774,39 +779,62 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
                     if db.tx_procesada(sig):
                         continue
 
-                    log.info(f"🎯 Nueva TX: {sig[:20]} | {tx.get('accion','?')} | {tx.get('dex','?')}")
+                    token_mint = tx.get("token_mint", "")
 
-                    # Marcar primero para evitar doble ejecución
-                    db.marcar_tx(sig)
-
-                    # Ejecutar trade
-                    resultado = await trader.copiar_trade(
-                        token_mint  = tx["token_mint"],
-                        accion      = tx["accion"],
-                        monto_usd   = cfg["monto_usd"],
-                        stop_loss   = cfg["stop_loss_pct"],
-                        take_profit = cfg["take_profit_pct"],
-                        max_minutos = cfg["max_minutos"],
-                        dex         = tx.get("dex", ""),
-                    )
-
-                    # Protección: no procesar si resultado es inválido
-                    if not resultado or not isinstance(resultado, dict):
-                        log.error(f"Trade retornó resultado inválido para {tx.get('token_mint','?')[:8]}")
+                    # Evitar abrir dos trades del mismo token simultáneamente
+                    if token_mint in tokens_en_trade:
+                        log.info(f"⏭️ Ya hay un trade activo para {token_mint[:8]}, ignorando")
+                        db.marcar_tx(sig)  # marcar igual para no reintentar
                         continue
 
-                    # Solo registrar en BD si hubo intento real (no sin_cotizacion)
-                    if resultado.get("estado") != "sin_cotizacion":
-                        db.registrar_trade(resultado)
+                    log.info(f"🎯 Nueva TX: {sig[:20]} | {tx.get('accion','?')} | {tx.get('dex','?')}")
+                    db.marcar_tx(sig)
+                    tokens_en_trade.add(token_mint)
 
-                    await notificar_resultado(ctx, tx, resultado)
+                    # Lanzar trade en background — NO bloquea el loop
+                    asyncio.create_task(
+                        _ejecutar_y_notificar(ctx, tx, cfg, tokens_en_trade)
+                    )
 
             except Exception as e:
                 log.error(f"Error procesando wallet {w['address'][:8]}: {e}", exc_info=True)
 
-        await asyncio.sleep(15)
+        # Sleep en trozos de 1s para que el flag "corriendo=False" pare rápido
+        for _ in range(15):
+            if not ctx.bot_data.get("corriendo"):
+                break
+            await asyncio.sleep(1)
 
     log.info("⏹️ Loop de monitoreo detenido")
+
+
+async def _ejecutar_y_notificar(ctx, tx: dict, cfg: dict, tokens_en_trade: set):
+    """Ejecuta un trade en background y notifica el resultado."""
+    token_mint = tx.get("token_mint", "")
+    try:
+        resultado = await trader.copiar_trade(
+            token_mint  = token_mint,
+            accion      = tx["accion"],
+            monto_usd   = cfg["monto_usd"],
+            stop_loss   = cfg["stop_loss_pct"],
+            take_profit = cfg["take_profit_pct"],
+            max_minutos = cfg["max_minutos"],
+            dex         = tx.get("dex", ""),
+        )
+
+        if not resultado or not isinstance(resultado, dict):
+            log.error(f"Trade retornó resultado inválido para {token_mint[:8]}")
+            return
+
+        if resultado.get("estado") != "sin_cotizacion":
+            db.registrar_trade(resultado)
+
+        await notificar_resultado(ctx, tx, resultado)
+
+    except Exception as e:
+        log.error(f"Error en _ejecutar_y_notificar para {token_mint[:8]}: {e}", exc_info=True)
+    finally:
+        tokens_en_trade.discard(token_mint)  # liberar siempre, aunque haya error
 
 
 async def notificar_resultado(ctx, tx: dict, resultado: dict):
