@@ -10,18 +10,18 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# RPCs confiables y activos — se eliminó projectserum.com (muerto)
+# RPCs públicos confiables — sin keys demo, todos funcionales
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
-    "https://rpc.ankr.com/solana",
-    "https://solana-mainnet.g.alchemy.com/v2/demo",
-    "https://mainnet.helius-rpc.com/?api-key=demo",
+    "https://solana.publicnode.com",
+    "https://endpoints.omniatech.io/v1/sol/mainnet/public",
+    "https://go.getblock.io/solana-mainnet",
 ]
 
 DEX_PROGRAMAS = {
     "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "Jupiter",
     "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB":  "Jupiter v4",
-    "JUP3c2Uh3WA4Ng34tw6kpd2G4LFvdpUtkzEgBAWUdT":  "Jupiter v3",
+    "JUP3c2Uh3WA4Ng34tw6kPd2G4LFvdpUtkzEgBAWUdT":  "Jupiter v3",
     "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "Raydium AMM",
     "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h": "Raydium AMM v2",
     "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": "Raydium CLMM",
@@ -71,11 +71,6 @@ class WalletMonitor:
         return None
 
     async def obtener_transacciones_nuevas(self, wallet_address: str, ya_procesadas: set) -> list:
-        """
-        Obtiene las últimas 10 transacciones de la wallet y retorna
-        solo las que NO han sido procesadas antes.
-        Esto evita perder trades cuando la ballena opera rápido.
-        """
         sigs = await self._rpc_call(
             "getSignaturesForAddress",
             [wallet_address, {"limit": 10}]
@@ -84,7 +79,6 @@ class WalletMonitor:
         if not sigs:
             return []
 
-        # Filtrar solo las no procesadas y sin error
         nuevas = [
             s for s in sigs
             if s.get("signature") not in ya_procesadas
@@ -94,18 +88,16 @@ class WalletMonitor:
         if not nuevas:
             return []
 
-        # Analizar cada TX nueva
         resultado = []
         for sig_info in nuevas:
             tx = await self._analizar_signature(sig_info["signature"])
             if tx:
                 resultado.append(tx)
-            await asyncio.sleep(0.2)  # pequeña pausa entre TXs
+            await asyncio.sleep(0.2)
 
         return resultado
 
     async def ultima_transaccion(self, wallet_address: str) -> Optional[dict]:
-        """Compatibilidad: retorna solo la última TX nueva."""
         sigs = await self._rpc_call(
             "getSignaturesForAddress",
             [wallet_address, {"limit": 5}]
@@ -123,7 +115,6 @@ class WalletMonitor:
         return None
 
     async def _analizar_signature(self, signature: str) -> Optional[dict]:
-        """Analiza una firma específica y retorna los datos del swap si es relevante."""
         tx_data = await self._rpc_call(
             "getTransaction",
             [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
@@ -140,7 +131,6 @@ class WalletMonitor:
             if meta.get("err"):
                 return None
 
-            # Verificar DEX
             account_keys = message.get("accountKeys", [])
             dex_usado    = None
             for key_info in account_keys:
@@ -152,7 +142,6 @@ class WalletMonitor:
             if not dex_usado:
                 return None
 
-            # Analizar cambios de tokens
             pre_tok  = meta.get("preTokenBalances",  [])
             post_tok = meta.get("postTokenBalances", [])
             pre_map  = {b["mint"]: float(b["uiTokenAmount"]["uiAmount"] or 0) for b in pre_tok}

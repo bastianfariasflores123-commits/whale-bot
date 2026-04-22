@@ -781,7 +781,15 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
                         max_minutos = cfg["max_minutos"],
                     )
 
-                    db.registrar_trade(resultado)
+                    # Protección contra resultado None o sin campos
+                    if not resultado or not isinstance(resultado, dict):
+                        log.error(f"Trade retornó resultado inválido: {resultado}")
+                        continue
+
+                    # Solo registrar y notificar si hubo intento real
+                    if resultado.get("estado") not in ("sin_cotizacion",):
+                        db.registrar_trade(resultado)
+
                     await notificar_resultado(ctx, tx, resultado)
 
             except Exception as e:
