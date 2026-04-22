@@ -820,19 +820,45 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def notificar_resultado(ctx, tx: dict, resultado: dict):
     """Envía la notificación de resultado al usuario de Telegram."""
-    pnl    = resultado.get("pnl_usd", 0)
-    emoji  = "✅" if pnl >= 0 else "❌"
-    signo  = "+" if pnl >= 0 else ""
-    duracion = resultado.get("duracion_min", 0)
+    if not resultado or not isinstance(resultado, dict):
+        return
 
+    pnl      = resultado.get("pnl_usd", 0) or 0
+    estado   = resultado.get("estado", "error")
+    emoji    = "✅" if pnl > 0 else ("⚠️" if pnl == 0 else "❌")
+    signo    = "+" if pnl >= 0 else ""
+    duracion = resultado.get("duracion_min", 0) or 0
+    tx_hash  = resultado.get("tx_hash") or "N/A"
+    accion   = tx.get("accion", "?") if tx else "?"
+
+    # Si el trade falló antes de abrir posición, notificar brevemente
+    if estado in ("tx_fallida_onchain", "swap_fallido", "sin_cotizacion"):
+        token = resultado.get("token", "N/A") or "N/A"
+        dex   = tx.get("dex", "") if tx else ""
+        await ctx.bot.send_message(
+            chat_id    = AUTHORIZED_USER,
+            text       = (
+                f"⚠️ *Trade no ejecutado*\n\n"
+                f"🪙 Token: `{token}`\n"
+                f"📋 Acción: `{accion.upper()}`\n"
+                f"❌ Motivo: `{estado}`\n"
+                f"🏪 DEX: `{dex}`\n\n"
+                f"_El token puede estar en bonding curve o sin liquidez suficiente_"
+            ),
+            parse_mode = "Markdown"
+        )
+        return
+
+    # Trade cerrado normalmente
+    tx_hash_str = str(tx_hash)[:20] if tx_hash and tx_hash != "N/A" else "N/A"
     mensaje = (
         f"{emoji} *Operación cerrada*\n\n"
         f"🪙 Token: `{resultado.get('token', 'N/A')}`\n"
-        f"📋 Acción: `{tx['accion'].upper()}`\n"
+        f"📋 Acción: `{accion.upper()}`\n"
         f"💰 Invertido: `${resultado.get('invertido', 0):.2f}`\n"
         f"💵 Resultado: `{signo}${abs(pnl):.2f}`\n"
         f"⏱️ Duración: `{duracion} min`\n"
-        f"🔗 TX: `{resultado.get('tx_hash', 'N/A')[:20]}...`\n\n"
+        f"🔗 TX: `{tx_hash_str}...`\n\n"
         f"📊 P&L acumulado: `${db.obtener_estadisticas()['pnl_total']:.2f}`"
     )
 

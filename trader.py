@@ -74,6 +74,36 @@ class SolanaTrader:
     def esta_listo(self) -> bool:
         return self.keypair is not None
 
+    async def _verificar_bonding_curve(self, token_mint: str) -> bool:
+        """
+        Verifica si un token de Pump.fun aún está en bonding curve.
+        Los tokens en bonding curve no se pueden comprar via Jupiter → error 6014.
+        Retorna True si está en bonding curve (no comprar), False si ya salió.
+        """
+        try:
+            session = await self._get_session()
+            # Intentar obtener cotización pequeña — si Jupiter no tiene ruta, está en bonding curve
+            params = {
+                "inputMint":    SOL_MINT,
+                "outputMint":   token_mint,
+                "amount":       "1000000",  # 0.001 SOL
+                "slippageBps":  "9900",
+            }
+            async with session.get(
+                "https://public.jupiterapi.com/quote",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    if data and "outAmount" in data and int(data.get("outAmount", 0)) > 0:
+                        return False  # Tiene ruta → ya salió de bonding curve
+                # Sin ruta o error → probablemente en bonding curve
+                return True
+        except Exception as e:
+            log.warning(f"No se pudo verificar bonding curve para {token_mint[:8]}: {e}")
+            return False  # En caso de duda, intentar el swap
+
     async def obtener_precio_sol(self) -> float:
         session = await self._get_session()
 
@@ -259,11 +289,17 @@ class SolanaTrader:
         sol_amount = monto_usd / precio_sol
         lamports   = int(sol_amount * 1_000_000_000)
 
-        # Pump.fun necesita slippage mayor — error 6014 = slippage exceeded
-        # Intentamos con slippage progresivo: 50% → 75% → 99%
+        # Pump.fun: verificar si el token ya salió de bonding curve
         es_pump_fun = "pump" in dex.lower()
-        slippages_a_intentar = [5000, 7500, 9900] if es_pump_fun else [1500, 3000, 5000]
+        if es_pump_fun:
+            en_bonding = await self._verificar_bonding_curve(token_mint)
+            if en_bonding:
+                log.warning(f"⏭️ Token {token_mint[:8]} aún en bonding curve — saltando")
+                resultado["estado"] = "bonding_curve"
+                return resultado
 
+        # Slippage progresivo: 50% → 75% → 99%
+        slippages_a_intentar = [5000, 7500, 9900] if es_pump_fun else [1500, 3000, 5000]
         slippage_entrada = slippages_a_intentar[0]
         log.info(f"{'🟢' if accion == 'compra' else '🔴'} Copiando {accion} | Token: {token_mint[:8]} | ${monto_usd} | Slippage inicial: {slippage_entrada//100}%")
 
