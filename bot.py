@@ -756,20 +756,28 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
         for w in wallets:
             try:
-                # Obtener todas las TXs procesadas para esta sesión
+                # Obtener TXs nuevas — pasamos un set vacío porque el filtro
+                # real se hace abajo con db.tx_procesada() para evitar duplicados
                 txs_nuevas = await monitor.obtener_transacciones_nuevas(
                     w["address"],
-                    ya_procesadas=set()  # El filtro se hace en db.tx_procesada
+                    ya_procesadas=set()
                 )
 
                 for tx in txs_nuevas:
-                    if db.tx_procesada(tx["signature"]):
+                    if not tx or not isinstance(tx, dict):
                         continue
 
-                    log.info(f"🎯 Nueva TX: {tx['signature'][:20]} | {tx['accion']} | {tx['dex']}")
+                    sig = tx.get("signature")
+                    if not sig:
+                        continue
+
+                    if db.tx_procesada(sig):
+                        continue
+
+                    log.info(f"🎯 Nueva TX: {sig[:20]} | {tx.get('accion','?')} | {tx.get('dex','?')}")
 
                     # Marcar primero para evitar doble ejecución
-                    db.marcar_tx(tx["signature"])
+                    db.marcar_tx(sig)
 
                     # Ejecutar trade
                     resultado = await trader.copiar_trade(
@@ -783,7 +791,7 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
                     # Protección: no procesar si resultado es inválido
                     if not resultado or not isinstance(resultado, dict):
-                        log.error(f"Trade retornó resultado inválido para {tx['token_mint'][:8]}")
+                        log.error(f"Trade retornó resultado inválido para {tx.get('token_mint','?')[:8]}")
                         continue
 
                     # Solo registrar en BD si hubo intento real (no sin_cotizacion)
@@ -793,7 +801,7 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
                     await notificar_resultado(ctx, tx, resultado)
 
             except Exception as e:
-                log.error(f"Error procesando wallet {w['address'][:8]}: {e}")
+                log.error(f"Error procesando wallet {w['address'][:8]}: {e}", exc_info=True)
 
         await asyncio.sleep(15)
 

@@ -12,23 +12,24 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Jupiter — múltiples endpoints, el principal suele ser bloqueado en algunos hosts
+# Jupiter — solo endpoints confirmados que funcionan en Railway
+# lite.jup.ag y quote-api.jup.ag están bloqueados en Railway (DNS no resuelve)
 JUPITER_QUOTE_URLS = [
-    "https://lite.jup.ag/v6/quote",           # endpoint lite, menos restricciones
-    "https://quote-api.jup.ag/v6/quote",       # principal
-    "https://public.jupiterapi.com/quote",     # espejo público
+    "https://public.jupiterapi.com/quote",     # funciona en Railway ✅
+    "https://quote-api.jup.ag/v6/quote",       # fallback por si cambia
+    "https://lite.jup.ag/v6/quote",            # fallback adicional
 ]
 JUPITER_SWAP_URLS = [
-    "https://lite.jup.ag/v6/swap",
+    "https://public.jupiterapi.com/swap",      # funciona en Railway ✅
     "https://quote-api.jup.ag/v6/swap",
-    "https://public.jupiterapi.com/swap",
+    "https://lite.jup.ag/v6/swap",
 ]
 
-# RPCs públicos sin key que aceptan envío de TXs
+# RPCs públicos — publicnode crashea con la librería solana de Python, usar solo mainnet
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
-    "https://solana.publicnode.com",
     "https://endpoints.omniatech.io/v1/sol/mainnet/public",
+    "https://rpc.ankr.com/solana",
 ]
 
 SOL_MINT       = "So11111111111111111111111111111111111111112"
@@ -163,7 +164,7 @@ class SolanaTrader:
                 "userPublicKey":             pubkey,
                 "wrapAndUnwrapSol":          True,
                 "dynamicComputeUnitLimit":   True,
-                "prioritizationFeeLamports": 10000,
+                "prioritizationFeeLamports": 50000,  # fee más alto para prioridad
             }
 
             # Intentar cada URL de swap
@@ -202,6 +203,9 @@ class SolanaTrader:
             signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
             # Enviar con fallback de RPCs
+            # NOTA: skip_preflight=True para evitar el crash de PanicException con publicnode
+            # El preflight falla con error 0x177e (SlippageExceeded) cuando el precio se mueve
+            # Con skip_preflight dejamos que la red lo maneje y reintentamos la cotización si falla
             for rpc_url in SOLANA_RPC_URLS:
                 try:
                     from solana.rpc.async_api import AsyncClient
@@ -210,10 +214,10 @@ class SolanaTrader:
                     async with AsyncClient(rpc_url) as client:
                         resp    = await client.send_raw_transaction(
                             bytes(signed_tx),
-                            opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+                            opts=TxOpts(skip_preflight=True, preflight_commitment="confirmed")
                         )
                         tx_hash = str(resp.value)
-                        log.info(f"✅ Swap ejecutado via {rpc_url[:35]}: {tx_hash[:20]}...")
+                        log.info(f"✅ Swap enviado via {rpc_url[:35]}: {tx_hash[:20]}...")
                         return tx_hash
                 except Exception as e:
                     log.warning(f"RPC {rpc_url[:35]} falló: {e}")
@@ -249,7 +253,11 @@ class SolanaTrader:
             input_mint  = SOL_MINT   if accion == "compra" else token_mint
             output_mint = token_mint if accion == "compra" else SOL_MINT
 
-            quote_entrada = await self.obtener_cotizacion(input_mint, output_mint, lamports, slippage_bps=300)
+            # Pump.fun tokens son muy volátiles — usar slippage alto (500 bps = 5%)
+            # para evitar el error 0x177e (SlippageToleranceExceeded)
+            slippage_entrada = 500
+
+            quote_entrada = await self.obtener_cotizacion(input_mint, output_mint, lamports, slippage_bps=slippage_entrada)
             if not quote_entrada:
                 resultado["estado"] = "sin_cotizacion"
                 log.warning(f"Sin cotización para {token_mint[:8]}")
