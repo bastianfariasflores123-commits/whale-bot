@@ -776,6 +776,12 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
                     log.info(f"🎯 Nueva TX: {sig[:20]} | {tx.get('accion','?')} | {tx.get('dex','?')}")
 
+                    # Solo copiar compras — las ventas son de tokens que no tenemos
+                    if tx.get('accion') != 'compra':
+                        log.info(f"⏭️ Ignorando {tx.get('accion','?')} — solo se copian compras")
+                        db.marcar_tx(sig)
+                        continue
+
                     # Marcar primero para evitar doble ejecución
                     db.marcar_tx(sig)
 
@@ -810,20 +816,13 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def notificar_resultado(ctx, tx: dict, resultado: dict):
     """Envía la notificación de resultado al usuario de Telegram."""
-    pnl      = resultado.get("pnl_usd", 0)
-    emoji    = "✅" if pnl >= 0 else "❌"
-    signo    = "+" if pnl >= 0 else "-"
+    pnl    = resultado.get("pnl_usd", 0)
+    emoji  = "✅" if pnl >= 0 else "❌"
+    signo  = "+" if pnl >= 0 else ""
     duracion = resultado.get("duracion_min", 0)
 
-    razones = {
-        "take_profit": "🎯 Take Profit",
-        "stop_loss":   "🛑 Stop Loss",
-        "timeout":     "⏱️ Timeout",
-    }
-    razon = razones.get(resultado.get("razon_cierre", ""), "⏹️ Manual")
-
     mensaje = (
-        f"{emoji} *Operación cerrada — {razon}*\n\n"
+        f"{emoji} *Operación cerrada*\n\n"
         f"🪙 Token: `{resultado.get('token', 'N/A')}`\n"
         f"📋 Acción: `{tx['accion'].upper()}`\n"
         f"💰 Invertido: `${resultado.get('invertido', 0):.2f}`\n"
