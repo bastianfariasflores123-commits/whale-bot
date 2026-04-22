@@ -223,34 +223,46 @@ class SolanaTrader:
             log.error(f"Error ejecutando swap: {e}")
             return None
 
-    async def verificar_tx(self, tx_hash: str) -> bool:
-        """Verifica si una TX realmente se confirmó en la blockchain sin error."""
+    async def verificar_tx(self, tx_hash: str, max_intentos: int = 5, espera: float = 4.0) -> bool:
+        """
+        Verifica si una TX realmente se confirmó en la blockchain sin error.
+        Reintenta hasta max_intentos veces con espera entre intentos.
+        Devuelve False si no puede confirmar — NUNCA asume éxito.
+        """
         session = await self._get_session()
         payload = {
             "jsonrpc": "2.0", "id": 1,
             "method":  "getTransaction",
             "params":  [tx_hash, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
         }
-        for rpc_url in SOLANA_RPC_URLS:
-            try:
-                async with session.post(rpc_url, json=payload,
-                                        timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status == 200:
-                        data   = await r.json()
-                        result = data.get("result")
-                        if result:
-                            err = result.get("meta", {}).get("err")
-                            if err is None:
-                                log.info(f"✅ TX {tx_hash[:16]} confirmada on-chain")
-                                return True
-                            else:
-                                log.warning(f"❌ TX {tx_hash[:16]} falló on-chain: {err}")
-                                return False
-            except Exception as e:
-                log.warning(f"Error verificando TX via {rpc_url[:35]}: {e}")
-        # No se pudo verificar aún (puede estar pendiente), asumir ok tras timeout
-        log.warning(f"⚠️ No se pudo verificar TX {tx_hash[:16]} — asumiendo ok")
-        return True
+        for intento in range(max_intentos):
+            for rpc_url in SOLANA_RPC_URLS:
+                try:
+                    async with session.post(rpc_url, json=payload,
+                                            timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        if r.status == 200:
+                            data   = await r.json()
+                            result = data.get("result")
+                            if result:
+                                err = result.get("meta", {}).get("err")
+                                if err is None:
+                                    log.info(f"✅ TX {tx_hash[:16]} confirmada on-chain (intento {intento+1})")
+                                    return True
+                                else:
+                                    # Error definitivo on-chain (ej: error 6014 de Jupiter/Pump.fun)
+                                    log.error(f"❌ TX {tx_hash[:16]} falló on-chain con error: {err}")
+                                    return False
+                            # result es None → TX aún pendiente, reintentar
+                except Exception as e:
+                    log.warning(f"Error verificando TX via {rpc_url[:35]}: {e}")
+
+            if intento < max_intentos - 1:
+                log.info(f"⏳ TX {tx_hash[:16]} aún pendiente, reintentando en {espera}s ({intento+1}/{max_intentos})...")
+                await asyncio.sleep(espera)
+
+        # Tras todos los intentos no se pudo leer → asumir fallida para no operar en falso
+        log.error(f"❌ No se pudo confirmar TX {tx_hash[:16]} tras {max_intentos} intentos — abortando posición")
+        return False
 
     async def copiar_trade(self, token_mint: str, accion: str, monto_usd: float,
                            stop_loss: float, take_profit: float, max_minutos: float) -> dict:
@@ -290,10 +302,10 @@ class SolanaTrader:
                 resultado["estado"] = "swap_fallido"
                 return resultado
 
-            # Esperar confirmación y verificar que no falló on-chain
+            # Esperar confirmación — Solana confirma en ~0.4s pero los RPCs públicos tardan más
             log.info(f"⏳ Esperando confirmación de TX {tx_entrada[:16]}...")
-            await asyncio.sleep(8)
-            tx_ok = await self.verificar_tx(tx_entrada)
+            await asyncio.sleep(12)
+            tx_ok = await self.verificar_tx(tx_entrada, max_intentos=6, espera=5.0)
 
             if not tx_ok:
                 log.warning(f"❌ TX {tx_entrada[:16]} falló on-chain — abortando")
@@ -302,7 +314,14 @@ class SolanaTrader:
                 return resultado
 
             resultado["tx_hash"] = tx_entrada
-            tokens_obtenidos     = int(quote_entrada.get("outAmount", 0))
+
+            # Usar outAmount de la cotización como fallback, pero intentar leer el balance real
+            tokens_obtenidos = int(quote_entrada.get("outAmount", 0))
+            if accion == "compra" and tokens_obtenidos <= 0:
+                log.error(f"❌ outAmount=0 en cotización para {token_mint[:8]} — abortando posición")
+                resultado["estado"] = "sin_tokens_recibidos"
+                return resultado
+
             log.info(f"✅ Posición abierta y confirmada | TX: {tx_entrada[:20]} | Tokens: {tokens_obtenidos}")
 
             # Monitorear posición
@@ -352,8 +371,8 @@ class SolanaTrader:
                     if quote_salida:
                         tx_salida = await self.ejecutar_swap(quote_salida)
                         if tx_salida:
-                            await asyncio.sleep(8)
-                            cierre_ok = await self.verificar_tx(tx_salida)
+                            await asyncio.sleep(12)
+                            cierre_ok = await self.verificar_tx(tx_salida, max_intentos=6, espera=5.0)
                             if cierre_ok:
                                 sol_final   = int(quote_salida.get("outAmount", 0)) / 1_000_000_000
                                 valor_final = sol_final * precio_sol
