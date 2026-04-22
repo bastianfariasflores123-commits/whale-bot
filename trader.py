@@ -12,20 +12,28 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL  = "https://quote-api.jup.ag/v6/swap"
+# Jupiter — múltiples endpoints, el principal suele ser bloqueado en algunos hosts
+JUPITER_QUOTE_URLS = [
+    "https://lite.jup.ag/v6/quote",           # endpoint lite, menos restricciones
+    "https://quote-api.jup.ag/v6/quote",       # principal
+    "https://public.jupiterapi.com/quote",     # espejo público
+]
+JUPITER_SWAP_URLS = [
+    "https://lite.jup.ag/v6/swap",
+    "https://quote-api.jup.ag/v6/swap",
+    "https://public.jupiterapi.com/swap",
+]
 
-# RPCs públicos que aceptan envío de TXs sin API key
+# RPCs públicos sin key que aceptan envío de TXs
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://solana.publicnode.com",
     "https://endpoints.omniatech.io/v1/sol/mainnet/public",
-    "https://go.getblock.io/solana-mainnet",
 ]
 
 SOL_MINT       = "So11111111111111111111111111111111111111112"
 USDC_MINT      = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-SOL_PRECIO_USD = 140.0  # fallback si todas las APIs fallan
+SOL_PRECIO_USD = 140.0
 
 
 class SolanaTrader:
@@ -69,7 +77,6 @@ class SolanaTrader:
         return self.keypair is not None
 
     async def obtener_precio_sol(self) -> float:
-        """Obtiene precio de SOL desde múltiples fuentes con fallback."""
         session = await self._get_session()
 
         # Fuente 1: CoinGecko
@@ -102,30 +109,11 @@ class SolanaTrader:
         except Exception as e:
             log.warning(f"Binance falló: {e}")
 
-        # Fuente 3: Jupiter Price API
-        try:
-            async with session.get(
-                f"https://price.jup.ag/v4/price?ids={SOL_MINT}",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                if r.status == 200:
-                    data   = await r.json()
-                    precio = data.get("data", {}).get(SOL_MINT, {}).get("price", 0)
-                    if precio > 0:
-                        log.info(f"💲 Precio SOL (Jupiter): ${precio}")
-                        return float(precio)
-        except Exception as e:
-            log.warning(f"Jupiter price falló: {e}")
-
-        log.warning(f"⚠️ Todas las fuentes de precio fallaron — usando fallback ${SOL_PRECIO_USD}")
+        log.warning(f"⚠️ Precio SOL fallback: ${SOL_PRECIO_USD}")
         return SOL_PRECIO_USD
 
     async def obtener_cotizacion(self, input_mint: str, output_mint: str,
                                   monto_lamports: int, slippage_bps: int = 300) -> Optional[dict]:
-        """
-        Obtiene cotización de Jupiter.
-        slippage_bps=300 = 3% — evita el error 0x177e en tokens volátiles.
-        """
         session = await self._get_session()
         params  = {
             "inputMint":        input_mint,
@@ -135,30 +123,31 @@ class SolanaTrader:
             "onlyDirectRoutes": "false",
         }
 
-        for intento in range(4):
-            try:
-                async with session.get(
-                    JUPITER_QUOTE_URL, params=params,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        if data and "outAmount" in data:
-                            return data
-                        log.warning(f"Jupiter cotización sin outAmount (intento {intento+1})")
-                    else:
-                        log.warning(f"Jupiter quote status {r.status} (intento {intento+1})")
-            except Exception as e:
-                log.warning(f"Jupiter quote error (intento {intento+1}): {e}")
+        # Intentar cada URL de Jupiter en orden
+        for quote_url in JUPITER_QUOTE_URLS:
+            for intento in range(2):
+                try:
+                    async with session.get(
+                        quote_url, params=params,
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            if data and "outAmount" in data:
+                                log.info(f"✅ Cotización obtenida via {quote_url[:35]}")
+                                return data
+                        else:
+                            log.warning(f"Jupiter {quote_url[:35]} status {r.status} (intento {intento+1})")
+                except Exception as e:
+                    log.warning(f"Jupiter {quote_url[:35]} error (intento {intento+1}): {e}")
 
-            if intento < 3:
-                await asyncio.sleep(2)
+                if intento < 1:
+                    await asyncio.sleep(1)
 
-        log.error("❌ Jupiter no disponible tras 4 intentos")
+        log.error("❌ Todos los endpoints de Jupiter fallaron")
         return None
 
     async def ejecutar_swap(self, quote_response: dict) -> Optional[str]:
-        """Ejecuta el swap REAL con fallback de RPCs públicos."""
         if not self.keypair:
             log.error("❌ No hay keypair cargado")
             return None
@@ -177,37 +166,42 @@ class SolanaTrader:
                 "prioritizationFeeLamports": 10000,
             }
 
-            # Obtener TX serializada de Jupiter con reintentos
+            # Intentar cada URL de swap
             swap_data = None
-            for intento in range(3):
-                try:
-                    async with session.post(
-                        JUPITER_SWAP_URL, json=payload,
-                        timeout=aiohttp.ClientTimeout(total=25)
-                    ) as r:
-                        if r.status == 200:
-                            swap_data = await r.json()
-                            if "swapTransaction" in swap_data:
-                                break
-                            swap_data = None
-                        else:
-                            log.warning(f"Jupiter swap status {r.status} (intento {intento+1})")
-                except Exception as e:
-                    log.warning(f"Jupiter swap error (intento {intento+1}): {e}")
+            for swap_url in JUPITER_SWAP_URLS:
+                for intento in range(2):
+                    try:
+                        async with session.post(
+                            swap_url, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=25)
+                        ) as r:
+                            if r.status == 200:
+                                swap_data = await r.json()
+                                if "swapTransaction" in swap_data:
+                                    log.info(f"✅ SwapTX obtenida via {swap_url[:35]}")
+                                    break
+                                swap_data = None
+                            else:
+                                log.warning(f"Swap {swap_url[:35]} status {r.status}")
+                    except Exception as e:
+                        log.warning(f"Swap {swap_url[:35]} error (intento {intento+1}): {e}")
 
-                if intento < 2:
-                    await asyncio.sleep(2)
+                    if intento < 1:
+                        await asyncio.sleep(1)
+
+                if swap_data and "swapTransaction" in swap_data:
+                    break
 
             if not swap_data or "swapTransaction" not in swap_data:
-                log.error("❌ No se pudo obtener swapTransaction de Jupiter")
+                log.error("❌ No se pudo obtener swapTransaction")
                 return None
 
-            # Firmar la transacción
+            # Firmar
             tx_bytes  = base64.b64decode(swap_data["swapTransaction"])
             tx        = VersionedTransaction.from_bytes(tx_bytes)
             signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
-            # Enviar con fallback de RPCs públicos reales sin key
+            # Enviar con fallback de RPCs
             for rpc_url in SOLANA_RPC_URLS:
                 try:
                     from solana.rpc.async_api import AsyncClient
@@ -222,9 +216,9 @@ class SolanaTrader:
                         log.info(f"✅ Swap ejecutado via {rpc_url[:35]}: {tx_hash[:20]}...")
                         return tx_hash
                 except Exception as e:
-                    log.warning(f"RPC {rpc_url[:35]} falló al enviar TX: {e}")
+                    log.warning(f"RPC {rpc_url[:35]} falló: {e}")
 
-            log.error("❌ Todos los RPCs fallaron al enviar la transacción")
+            log.error("❌ Todos los RPCs fallaron al enviar TX")
             return None
 
         except Exception as e:
@@ -255,7 +249,6 @@ class SolanaTrader:
             input_mint  = SOL_MINT   if accion == "compra" else token_mint
             output_mint = token_mint if accion == "compra" else SOL_MINT
 
-            # Cotización con slippage 3%
             quote_entrada = await self.obtener_cotizacion(input_mint, output_mint, lamports, slippage_bps=300)
             if not quote_entrada:
                 resultado["estado"] = "sin_cotizacion"

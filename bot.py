@@ -781,13 +781,13 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
                         max_minutos = cfg["max_minutos"],
                     )
 
-                    # Protección contra resultado None o sin campos
+                    # Protección: no procesar si resultado es inválido
                     if not resultado or not isinstance(resultado, dict):
-                        log.error(f"Trade retornó resultado inválido: {resultado}")
+                        log.error(f"Trade retornó resultado inválido para {tx['token_mint'][:8]}")
                         continue
 
-                    # Solo registrar y notificar si hubo intento real
-                    if resultado.get("estado") not in ("sin_cotizacion",):
+                    # Solo registrar en BD si hubo intento real (no sin_cotizacion)
+                    if resultado.get("estado") != "sin_cotizacion":
                         db.registrar_trade(resultado)
 
                     await notificar_resultado(ctx, tx, resultado)
