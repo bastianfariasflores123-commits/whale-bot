@@ -776,6 +776,15 @@ async def loop_monitoreo(ctx: ContextTypes.DEFAULT_TYPE):
 
                     log.info(f"🎯 Nueva TX: {sig[:20]} | {tx.get('accion','?')} | {tx.get('dex','?')}")
 
+                    # ── SOLO copiar COMPRAS de la ballena ──────────────────
+                    # Las ventas las maneja el bot con SL/TP automáticamente.
+                    # Si copiamos ventas de la ballena intentamos vender tokens
+                    # que no tenemos → error 6025 "NotEnoughTokens"
+                    if tx.get("accion") != "compra":
+                        log.info(f"⏭️ Ignorando {tx.get('accion','?')} de ballena — el bot gestiona salidas con SL/TP")
+                        db.marcar_tx(sig)
+                        continue
+
                     # Marcar primero para evitar doble ejecución
                     db.marcar_tx(sig)
 

@@ -260,10 +260,12 @@ class SolanaTrader:
         lamports   = int(sol_amount * 1_000_000_000)
 
         # Pump.fun necesita slippage mayor — error 6014 = slippage exceeded
-        es_pump_fun      = "pump" in dex.lower()
-        slippage_entrada = 5000 if es_pump_fun else 1500   # 50% pump.fun, 15% resto
+        # Intentamos con slippage progresivo: 50% → 75% → 99%
+        es_pump_fun = "pump" in dex.lower()
+        slippages_a_intentar = [5000, 7500, 9900] if es_pump_fun else [1500, 3000, 5000]
 
-        log.info(f"{'🟢' if accion == 'compra' else '🔴'} Copiando {accion} | Token: {token_mint[:8]} | ${monto_usd} | Slippage: {slippage_entrada//100}%")
+        slippage_entrada = slippages_a_intentar[0]
+        log.info(f"{'🟢' if accion == 'compra' else '🔴'} Copiando {accion} | Token: {token_mint[:8]} | ${monto_usd} | Slippage inicial: {slippage_entrada//100}%")
 
         resultado = {
             "token":        token_mint[:8] + "...",
@@ -280,28 +282,35 @@ class SolanaTrader:
             input_mint  = SOL_MINT   if accion == "compra" else token_mint
             output_mint = token_mint if accion == "compra" else SOL_MINT
 
-            quote_entrada = await self.obtener_cotizacion(
-                input_mint, output_mint, lamports, slippage_bps=slippage_entrada
-            )
-            if not quote_entrada:
-                resultado["estado"] = "sin_cotizacion"
-                log.warning(f"Sin cotización para {token_mint[:8]}")
-                return resultado
+            # Reintentar con slippage progresivo si falla por error 6014
+            tx_entrada   = None
+            quote_entrada = None
 
-            tx_entrada = await self.ejecutar_swap(quote_entrada)
+            for slippage_intento in slippages_a_intentar:
+                quote_entrada = await self.obtener_cotizacion(
+                    input_mint, output_mint, lamports, slippage_bps=slippage_intento
+                )
+                if not quote_entrada:
+                    continue
+
+                tx_entrada = await self.ejecutar_swap(quote_entrada)
+                if not tx_entrada:
+                    continue
+
+                log.info(f"⏳ Esperando confirmación TX {tx_entrada[:16]}... (slippage {slippage_intento//100}%)")
+                await asyncio.sleep(12)
+                tx_ok = await self.verificar_tx(tx_entrada)
+
+                if tx_ok:
+                    log.info(f"✅ TX confirmada con slippage {slippage_intento//100}%")
+                    break
+                else:
+                    log.warning(f"❌ TX falló con slippage {slippage_intento//100}% — reintentando con más slippage...")
+                    tx_entrada = None
+                    await asyncio.sleep(2)
+
             if not tx_entrada:
-                resultado["estado"] = "swap_fallido"
-                return resultado
-
-            # Esperar y verificar — NUNCA asume éxito
-            log.info(f"⏳ Esperando confirmación de TX {tx_entrada[:16]}...")
-            await asyncio.sleep(12)
-            tx_ok = await self.verificar_tx(tx_entrada)
-
-            if not tx_ok:
-                log.warning(f"❌ TX {tx_entrada[:16]} falló on-chain — abortando")
                 resultado["estado"]  = "tx_fallida_onchain"
-                resultado["tx_hash"] = tx_entrada
                 return resultado
 
             resultado["tx_hash"] = tx_entrada
