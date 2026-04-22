@@ -12,8 +12,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Jupiter — múltiples endpoints, el principal suele ser bloqueado en algunos hosts
-# Jupiter — public.jupiterapi.com primero (único que funciona en Railway)
+# Jupiter — public.jupiterapi.com primero, único que funciona en Railway
 # lite.jup.ag y quote-api.jup.ag están bloqueados en Railway (DNS no resuelve)
 JUPITER_QUOTE_URLS = [
     "https://public.jupiterapi.com/quote",
@@ -26,7 +25,7 @@ JUPITER_SWAP_URLS = [
     "https://lite.jup.ag/v6/swap",
 ]
 
-# RPCs — publicnode crashea con la librería solana de Python, excluido
+# RPCs — solana.publicnode.com crashea con PanicException, excluido
 SOLANA_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://endpoints.omniatech.io/v1/sol/mainnet/public",
@@ -81,7 +80,6 @@ class SolanaTrader:
     async def obtener_precio_sol(self) -> float:
         session = await self._get_session()
 
-        # Fuente 1: CoinGecko
         try:
             async with session.get(
                 "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
@@ -96,7 +94,6 @@ class SolanaTrader:
         except Exception as e:
             log.warning(f"CoinGecko falló: {e}")
 
-        # Fuente 2: Binance
         try:
             async with session.get(
                 "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT",
@@ -115,17 +112,17 @@ class SolanaTrader:
         return SOL_PRECIO_USD
 
     async def obtener_cotizacion(self, input_mint: str, output_mint: str,
-                                  monto_lamports: int, slippage_bps: int = 300) -> Optional[dict]:
+                                  monto_lamports: int, slippage_bps: int = 1500) -> Optional[dict]:
         session = await self._get_session()
         params  = {
-            "inputMint":        input_mint,
-            "outputMint":       output_mint,
-            "amount":           str(monto_lamports),
-            "slippageBps":      str(slippage_bps),
-            "onlyDirectRoutes": "false",
+            "inputMint":           input_mint,
+            "outputMint":          output_mint,
+            "amount":              str(monto_lamports),
+            "slippageBps":         str(slippage_bps),
+            "onlyDirectRoutes":    "false",
+            "asLegacyTransaction": "false",  # necesario para tokens Token-2022 de Pump.fun
         }
 
-        # Intentar cada URL de Jupiter en orden
         for quote_url in JUPITER_QUOTE_URLS:
             for intento in range(2):
                 try:
@@ -139,14 +136,15 @@ class SolanaTrader:
                                 log.info(f"✅ Cotización obtenida via {quote_url[:35]}")
                                 return data
                         else:
-                            log.warning(f"Jupiter {quote_url[:35]} status {r.status} (intento {intento+1})")
+                            text = await r.text()
+                            log.warning(f"Jupiter {quote_url[:35]} status {r.status}: {text[:80]}")
                 except Exception as e:
                     log.warning(f"Jupiter {quote_url[:35]} error (intento {intento+1}): {e}")
 
                 if intento < 1:
                     await asyncio.sleep(1)
 
-        log.error("❌ Todos los endpoints de Jupiter fallaron")
+        log.error("❌ Jupiter no disponible tras todos los intentos")
         return None
 
     async def ejecutar_swap(self, quote_response: dict) -> Optional[str]:
@@ -168,7 +166,6 @@ class SolanaTrader:
                 "prioritizationFeeLamports": 50000,
             }
 
-            # Intentar cada URL de swap
             swap_data = None
             for swap_url in JUPITER_SWAP_URLS:
                 for intento in range(2):
@@ -198,12 +195,11 @@ class SolanaTrader:
                 log.error("❌ No se pudo obtener swapTransaction")
                 return None
 
-            # Firmar
             tx_bytes  = base64.b64decode(swap_data["swapTransaction"])
             tx        = VersionedTransaction.from_bytes(tx_bytes)
             signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
-            # Enviar con fallback de RPCs
+            # skip_preflight=True para evitar crash PanicException con algunos RPCs
             for rpc_url in SOLANA_RPC_URLS:
                 try:
                     from solana.rpc.async_api import AsyncClient
@@ -226,6 +222,35 @@ class SolanaTrader:
         except Exception as e:
             log.error(f"Error ejecutando swap: {e}")
             return None
+
+    async def verificar_tx(self, tx_hash: str) -> bool:
+        """Verifica si una TX realmente se confirmó en la blockchain sin error."""
+        session = await self._get_session()
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method":  "getTransaction",
+            "params":  [tx_hash, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
+        }
+        for rpc_url in SOLANA_RPC_URLS:
+            try:
+                async with session.post(rpc_url, json=payload,
+                                        timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        data   = await r.json()
+                        result = data.get("result")
+                        if result:
+                            err = result.get("meta", {}).get("err")
+                            if err is None:
+                                log.info(f"✅ TX {tx_hash[:16]} confirmada on-chain")
+                                return True
+                            else:
+                                log.warning(f"❌ TX {tx_hash[:16]} falló on-chain: {err}")
+                                return False
+            except Exception as e:
+                log.warning(f"Error verificando TX via {rpc_url[:35]}: {e}")
+        # No se pudo verificar aún (puede estar pendiente), asumir ok tras timeout
+        log.warning(f"⚠️ No se pudo verificar TX {tx_hash[:16]} — asumiendo ok")
+        return True
 
     async def copiar_trade(self, token_mint: str, accion: str, monto_usd: float,
                            stop_loss: float, take_profit: float, max_minutos: float) -> dict:
@@ -251,11 +276,10 @@ class SolanaTrader:
             input_mint  = SOL_MINT   if accion == "compra" else token_mint
             output_mint = token_mint if accion == "compra" else SOL_MINT
 
-            # Pump.fun tokens son extremadamente volátiles
-            # 1000 bps = 10% de slippage para evitar error 0x177e (SlippageToleranceExceeded)
-            slippage_entrada = 1000
-
-            quote_entrada = await self.obtener_cotizacion(input_mint, output_mint, lamports, slippage_bps=slippage_entrada)
+            # 1500 bps = 15% slippage para tokens Pump.fun (extremadamente volátiles)
+            quote_entrada = await self.obtener_cotizacion(
+                input_mint, output_mint, lamports, slippage_bps=1500
+            )
             if not quote_entrada:
                 resultado["estado"] = "sin_cotizacion"
                 log.warning(f"Sin cotización para {token_mint[:8]}")
@@ -266,9 +290,20 @@ class SolanaTrader:
                 resultado["estado"] = "swap_fallido"
                 return resultado
 
+            # Esperar confirmación y verificar que no falló on-chain
+            log.info(f"⏳ Esperando confirmación de TX {tx_entrada[:16]}...")
+            await asyncio.sleep(8)
+            tx_ok = await self.verificar_tx(tx_entrada)
+
+            if not tx_ok:
+                log.warning(f"❌ TX {tx_entrada[:16]} falló on-chain — abortando")
+                resultado["estado"]  = "tx_fallida_onchain"
+                resultado["tx_hash"] = tx_entrada
+                return resultado
+
             resultado["tx_hash"] = tx_entrada
             tokens_obtenidos     = int(quote_entrada.get("outAmount", 0))
-            log.info(f"✅ Posición abierta | TX: {tx_entrada[:20]} | Tokens: {tokens_obtenidos}")
+            log.info(f"✅ Posición abierta y confirmada | TX: {tx_entrada[:20]} | Tokens: {tokens_obtenidos}")
 
             # Monitorear posición
             max_segundos = max_minutos * 60
@@ -282,7 +317,9 @@ class SolanaTrader:
                 if int(elapsed) % 5 == 0 and elapsed > 0:
                     precio_sol = await self.obtener_precio_sol()
 
-                quote_actual = await self.obtener_cotizacion(token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=1000)
+                quote_actual = await self.obtener_cotizacion(
+                    token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=1500
+                )
                 if quote_actual:
                     valor_sol = int(quote_actual.get("outAmount", 0)) / 1_000_000_000
                     valor_usd = valor_sol * precio_sol
@@ -310,18 +347,22 @@ class SolanaTrader:
             if accion == "compra" and tokens_obtenidos > 0:
                 for intento_cierre in range(3):
                     quote_salida = await self.obtener_cotizacion(
-                        token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=1000
+                        token_mint, SOL_MINT, tokens_obtenidos, slippage_bps=1500
                     )
                     if quote_salida:
                         tx_salida = await self.ejecutar_swap(quote_salida)
                         if tx_salida:
-                            sol_final   = int(quote_salida.get("outAmount", 0)) / 1_000_000_000
-                            valor_final = sol_final * precio_sol
-                            pnl         = valor_final - monto_usd
-                            log.info(f"{'✅' if pnl>=0 else '❌'} Posición cerrada | PnL: {'+' if pnl>=0 else ''}${pnl:.2f}")
-                            break
-                    log.warning(f"Reintentando cierre {intento_cierre+1}/3...")
-                    await asyncio.sleep(2)
+                            await asyncio.sleep(8)
+                            cierre_ok = await self.verificar_tx(tx_salida)
+                            if cierre_ok:
+                                sol_final   = int(quote_salida.get("outAmount", 0)) / 1_000_000_000
+                                valor_final = sol_final * precio_sol
+                                pnl         = valor_final - monto_usd
+                                log.info(f"{'✅' if pnl>=0 else '❌'} Posición cerrada | PnL: {'+' if pnl>=0 else ''}${pnl:.2f}")
+                                break
+                            else:
+                                log.warning(f"TX cierre falló on-chain, reintentando {intento_cierre+1}/3...")
+                    await asyncio.sleep(3)
 
             duracion = round((time.time() - inicio) / 60, 1)
             resultado.update({
