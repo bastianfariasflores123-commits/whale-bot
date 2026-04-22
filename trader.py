@@ -226,8 +226,7 @@ class SolanaTrader:
     async def verificar_tx(self, tx_hash: str, max_intentos: int = 5, espera: float = 4.0) -> bool:
         """
         Verifica si una TX realmente se confirmó en la blockchain sin error.
-        Reintenta hasta max_intentos veces con espera entre intentos.
-        Devuelve False si no puede confirmar — NUNCA asume éxito.
+        Reintenta hasta max_intentos veces. NUNCA asume éxito si no puede confirmar.
         """
         session = await self._get_session()
         payload = {
@@ -249,24 +248,21 @@ class SolanaTrader:
                                     log.info(f"✅ TX {tx_hash[:16]} confirmada on-chain (intento {intento+1})")
                                     return True
                                 else:
-                                    # Error definitivo on-chain (ej: error 6014 de Jupiter/Pump.fun)
-                                    log.error(f"❌ TX {tx_hash[:16]} falló on-chain con error: {err}")
+                                    log.error(f"❌ TX {tx_hash[:16]} falló on-chain: {err}")
                                     return False
-                            # result es None → TX aún pendiente, reintentar
+                            # result=None → TX aún pendiente, reintentar
                 except Exception as e:
                     log.warning(f"Error verificando TX via {rpc_url[:35]}: {e}")
 
             if intento < max_intentos - 1:
-                log.info(f"⏳ TX {tx_hash[:16]} aún pendiente, reintentando en {espera}s ({intento+1}/{max_intentos})...")
+                log.info(f"⏳ TX {tx_hash[:16]} pendiente, reintentando en {espera}s ({intento+1}/{max_intentos})...")
                 await asyncio.sleep(espera)
 
-        # Tras todos los intentos no se pudo leer → asumir fallida para no operar en falso
-        log.error(f"❌ No se pudo confirmar TX {tx_hash[:16]} tras {max_intentos} intentos — abortando posición")
+        log.error(f"❌ No se pudo confirmar TX {tx_hash[:16]} tras {max_intentos} intentos — abortando")
         return False
 
     async def copiar_trade(self, token_mint: str, accion: str, monto_usd: float,
                            stop_loss: float, take_profit: float, max_minutos: float) -> dict:
-        inicio     = time.time()
         precio_sol = await self.obtener_precio_sol()
         sol_amount = monto_usd / precio_sol
         lamports   = int(sol_amount * 1_000_000_000)
@@ -314,26 +310,35 @@ class SolanaTrader:
                 return resultado
 
             resultado["tx_hash"] = tx_entrada
+            tokens_obtenidos     = int(quote_entrada.get("outAmount", 0))
 
-            # Usar outAmount de la cotización como fallback, pero intentar leer el balance real
-            tokens_obtenidos = int(quote_entrada.get("outAmount", 0))
-            if accion == "compra" and tokens_obtenidos <= 0:
-                log.error(f"❌ outAmount=0 en cotización para {token_mint[:8]} — abortando posición")
+            # Guard: si no hay tokens reales no monitorear
+            if tokens_obtenidos <= 0:
+                log.error(f"❌ outAmount=0 para {token_mint[:8]} — abortando posición")
                 resultado["estado"] = "sin_tokens_recibidos"
                 return resultado
 
-            log.info(f"✅ Posición abierta y confirmada | TX: {tx_entrada[:20]} | Tokens: {tokens_obtenidos}")
+            log.info(f"✅ Posición abierta | TX: {tx_entrada[:20]} | Tokens: {tokens_obtenidos}")
 
-            # Monitorear posición
+            # ── El timer empieza AQUÍ, cuando la posición realmente está abierta ──
+            inicio       = time.time()
             max_segundos = max_minutos * 60
             sl_factor    = 1 - (stop_loss / 100)
             tp_factor    = 1 + (take_profit / 100)
             pnl          = 0.0
+            razon_cierre = "timeout"
 
             while True:
-                elapsed = (time.time() - inicio) / 60
+                # Chequear timeout AL INICIO del loop, antes del sleep
+                elapsed_seg = time.time() - inicio
+                if elapsed_seg >= max_segundos:
+                    log.info(f"⏱️ Timeout {max_minutos}min alcanzado")
+                    razon_cierre = "timeout"
+                    break
 
-                if int(elapsed) % 5 == 0 and elapsed > 0:
+                # Actualizar precio SOL cada 5 minutos
+                elapsed_min = elapsed_seg / 60
+                if elapsed_min > 0 and int(elapsed_min) % 5 == 0:
                     precio_sol = await self.obtener_precio_sol()
 
                 quote_actual = await self.obtener_cotizacion(
@@ -345,24 +350,23 @@ class SolanaTrader:
                     pnl       = valor_usd - monto_usd
                     cambio    = valor_usd / monto_usd if monto_usd else 1
 
-                    log.info(f"📊 Posición: ${valor_usd:.2f} | PnL: {'+' if pnl>=0 else ''}{pnl:.2f} | {elapsed:.1f}min")
+                    log.info(f"📊 Posición: ${valor_usd:.2f} | PnL: {'+' if pnl>=0 else ''}{pnl:.2f} | {elapsed_min:.1f}min")
 
                     if cambio >= tp_factor:
                         log.info(f"🎯 Take Profit {take_profit}% alcanzado")
+                        razon_cierre = "take_profit"
                         break
                     if cambio <= sl_factor:
                         log.info(f"🛑 Stop Loss {stop_loss}% activado")
+                        razon_cierre = "stop_loss"
                         break
                 else:
                     log.warning("⚠️ Sin cotización al monitorear — reintentando en 30s")
 
-                if (time.time() - inicio) >= max_segundos:
-                    log.info(f"⏱️ Timeout {max_minutos}min alcanzado")
-                    break
-
                 await asyncio.sleep(30)
 
-            # Cerrar posición con reintentos
+            # ── Cerrar posición con reintentos ──
+            pnl_real = pnl  # fallback al último PnL conocido del loop
             if accion == "compra" and tokens_obtenidos > 0:
                 for intento_cierre in range(3):
                     quote_salida = await self.obtener_cotizacion(
@@ -374,10 +378,12 @@ class SolanaTrader:
                             await asyncio.sleep(12)
                             cierre_ok = await self.verificar_tx(tx_salida, max_intentos=6, espera=5.0)
                             if cierre_ok:
+                                # PnL real = lo que realmente recibiste en SOL convertido a USD
                                 sol_final   = int(quote_salida.get("outAmount", 0)) / 1_000_000_000
+                                precio_sol  = await self.obtener_precio_sol()
                                 valor_final = sol_final * precio_sol
-                                pnl         = valor_final - monto_usd
-                                log.info(f"{'✅' if pnl>=0 else '❌'} Posición cerrada | PnL: {'+' if pnl>=0 else ''}${pnl:.2f}")
+                                pnl_real    = valor_final - monto_usd
+                                log.info(f"{'✅' if pnl_real>=0 else '❌'} Posición cerrada ({razon_cierre}) | PnL real: {'+' if pnl_real>=0 else ''}${pnl_real:.2f}")
                                 break
                             else:
                                 log.warning(f"TX cierre falló on-chain, reintentando {intento_cierre+1}/3...")
@@ -385,9 +391,10 @@ class SolanaTrader:
 
             duracion = round((time.time() - inicio) / 60, 1)
             resultado.update({
-                "pnl_usd":      round(pnl, 4),
+                "pnl_usd":      round(pnl_real, 4),
                 "duracion_min": duracion,
                 "estado":       "cerrado",
+                "razon_cierre": razon_cierre,
             })
 
         except Exception as e:
